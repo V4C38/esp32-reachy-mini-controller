@@ -8,18 +8,20 @@ Hold a [Waveshare ESP32-S3-Touch-AMOLED-1.8](https://www.waveshare.com/esp32-s3-
 
 This repo is a hardware motion controller for Reachy Mini, split across the board and the robot:
 
-- **Custom firmware** for the Waveshare board — IMU fusion (Mahony + ZUPT displacement), an LVGL face that mirrors your motion, and a WiFi WebSocket client that streams pose at 20 Hz
-- **A Reachy Mini Python app** that receives controller state and applies the clutch mapping, workspace safety limits, antenna idle animation, and body follow only when head exceeds the neck yaw threshold
-- **Host-side test harnesses** — IMU integrator simulation, fake controller, loopback tests, CI
+- **Custom firmware** for the Waveshare board — IMU fusion (Mahony + ZUPT displacement), an LVGL face that mirrors your motion, and a WiFi WebSocket client that streams sensor samples at 20 Hz
+- **A Reachy Mini Python app** that receives samples through a versioned protocol, runs one pure control reducer, and owns a single fixed-rate SDK command loop (clutch mapping, workspace safety, antenna idle animation, body follow)
+- **Host-side test harnesses** — IMU integrator simulation, fake controller, loopback tests, CI, v1 trajectory baselines
 
-The ESP32 owns *how the device moved*. Python owns *what the robot should do*. The wire contract between them is documented in [`PROTOCOL.md`](PROTOCOL.md).
+The ESP32 owns *how the device moved*. Python owns *what the robot should do*. The wire contract is **protocol v2** in [`PROTOCOL.md`](PROTOCOL.md). Firmware and app must be upgraded together.
 
 ## How it works
 
 ```
-ESP32 (250 Hz IMU → 20 Hz WS)  →  Motion Controller app (:8766)
-                                       ↓
-                              Reachy Mini daemon (Lite / USB)
+ESP32 (250 Hz IMU → 20 Hz sample)  →  Motion Controller app (:8766)
+                                          ↓
+                                 one 20 Hz control / SDK owner
+                                          ↓
+                                 Reachy Mini daemon (Lite / USB)
 ```
 
 - **Motion** — the onboard QMI8658 runs through a Mahony filter for attitude and a ZUPT integrator for displacement. Axis conventions and bring-up checks live in [`tools/bringup.md`](tools/bringup.md).
@@ -61,7 +63,7 @@ idf.py set-target esp32s3          # first time only
 idf.py -p /dev/cu.usbmodem101 flash monitor
 ```
 
-Keeping `monitor` attached after flashing is the proper way to verify a flash: you should see `UI ready`, the IMU calibration line `mapped accel [...]` (≈ `[0 0 +9.8]` when the board lies flat on the desk), and the face should appear within two seconds.
+Keeping `monitor` attached after flashing is the proper way to verify a flash: you should see `UI ready`, the IMU calibration line `mapped accel [...]` (≈ `[0 0 +9.8]` when the board lies flat on the desk), `host hello ok (protocol 2)`, and the face should appear within two seconds.
 
 ### Black screen (known failure mode)
 
@@ -75,16 +77,14 @@ E (…) co5300_spi: panel_co5300_draw_bitmap(…): send color data failed
 
 **Cause:** LVGL framebuffers live in PSRAM, so each QSPI flush copies a strip into an *internal* DMA bounce buffer. The SPI bus was configured with a full-frame `max_transfer_sz`, so those bounce allocs were ~70 KB+. After WiFi + the WebSocket stack came up, internal DMA heap was exhausted (`setup_dma_priv_buffer` failed), `draw_bitmap` never queued a transfer, the flush completion callback never ran, and the UI froze on a black panel until reboot.
 
-**Fix:**
+**Fix (already in this tree):**
 - Cap QSPI `max_transfer_sz` at 16 KB so bounce buffers stay small
 - Raise `CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL` to 100 KB so DMA heap survives WiFi bring-up
-- Keep LVGL buffers in PSRAM; do **not** enable `psram_dma_direct` here (with instruction/rodata XIP from PSRAM it DMA-underflows the SPI engine)
-- Serialize brightness `tx_param` with the LVGL lock (a separate race that can also lose flush callbacks)
+- Keep LVGL buffers in PSRAM; do **not** enable `psram_dma_direct` here
+- Serialize brightness `tx_param` with the LVGL lock
 - Bounded flush wait recovers / restarts if a transfer never completes
 
-A related failure: the panel lights at boot, then goes black while the firmware keeps running (mDNS / WiFi logs, no SPI errors). That happens when the CO5300 loses Sleep-Out / Display-On / GRAM / brightness after USB-UART **RTS/DTR** resets (`idf.py flash|monitor`, esptool, pyserial `setRTS`) and WiFi RF bring-up, while LVGL still thinks the last frame is on screen. Firmware now reasserts Display-On after WiFi comes up, periodically while linked, and with a full brightness + redraw keepalive while offline. Touch probe failures no longer abort boot (`Touch not found` → continue without input). Opening a serial port just to read logs should leave RTS/DTR alone — see the board note in the sibling `esp32-experiments` repo README.
-
-A black screen is a bug, not a normal outcome — capture the log if it persists after this firmware.
+A related failure: the panel lights at boot, then goes black while the firmware keeps running (mDNS / WiFi logs, no SPI errors). That happens when the CO5300 loses Sleep-Out / Display-On / GRAM / brightness after USB-UART **RTS/DTR** resets and WiFi RF bring-up. Firmware reasserts Display-On after WiFi comes up, periodically while linked, and with a full brightness + redraw keepalive while offline.
 
 ### 4. Hold it right
 
@@ -94,16 +94,23 @@ A black screen is a bug, not a normal outcome — capture the log if it persists
 
 Untethered use needs a **3.7V MX1.25 LiPo** on the board; USB alone dies when unplugged.
 
+## Protocol v2 cutover / rollback
+
+| Pair | Result |
+|------|--------|
+| FW v2 + app v2 | Supported |
+| Mixed v1/v2 | Non-functional (hello / message type mismatch) |
+
+Rollback: reflash the previous firmware image and reinstall the previous app commit as a pair. Resource baselines: [`tools/baselines/`](tools/baselines/).
+
 ## Testing
 
 ```bash
-# Unit tests + host IMU sim (no hardware)
+# Unit tests + host IMU sim + loopback + firmware build (when IDF present)
 ./tools/run-ci.sh
 
-# Loopback against mockup daemon (no robot needed)
-reachy-mini-daemon --mockup-sim &
-python -m esp32_motion_controller.main --log-only &
-python tools/fake_controller.py engage_rotate_release
+# Loopback only
+python tools/loopback_test.py --start-app
 ```
 
 ## Layout
@@ -111,10 +118,10 @@ python tools/fake_controller.py engage_rotate_release
 | Path | Contents |
 |---|---|
 | `firmware/` | The ESP-IDF project: IMU, face UI, WiFi + WebSocket client |
-| `reachy-mini-app/` | Motion Controller Reachy Mini app |
-| `tools/` | Serial capture, IMU sim, fake controller, bring-up notes, CI |
+| `reachy-mini-app/` | Motion Controller Reachy Mini app (protocol v2) |
+| `tools/` | Serial capture, IMU sim, fake controller, baselines, bring-up, CI |
 | `assets/` | Source artwork (Reachy face) |
-| `PROTOCOL.md` | WebSocket JSON contract |
+| `PROTOCOL.md` | WebSocket JSON contract (v2) |
 
 ## License
 

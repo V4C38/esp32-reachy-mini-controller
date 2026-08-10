@@ -43,12 +43,12 @@ static void app_task(void *arg)
     uint16_t port = RMC_WS_PORT;
     uint32_t seq = 0;
     int64_t last_send = 0;
-    int64_t last_status = 0;
     int64_t last_connect_attempt = 0;
     int64_t disconnect_since = 0;
     int64_t unlink_since = 0;
     bool was_linked = false;
     bool have_host = false;
+    bool samples_paused = false;
 
     ESP_LOGI(TAG, "app_task started");
 
@@ -56,14 +56,19 @@ static void app_task(void *arg)
         /* Drained every pass: while offline the request is simply dropped so
          * it can't fire late once the app comes back. */
         if (ui_take_reset_request()) {
-            if (net_ws_connected()) net_ws_send_reset();
-            else ESP_LOGI(TAG, "reset ignored — app not linked");
+            if (net_ws_connected()) {
+                samples_paused = true;
+                net_ws_send_reset();
+            } else {
+                ESP_LOGI(TAG, "reset ignored — app not linked");
+            }
         }
 
         if (!net_wifi_connected()) {
             have_host = false;
             disconnect_since = 0;
             unlink_since = 0;
+            samples_paused = false;
             if (net_ws_running()) net_ws_stop();
             ui_set_linked(false);
             vTaskDelay(pdMS_TO_TICKS(500));
@@ -72,6 +77,7 @@ static void app_task(void *arg)
 
         if (!net_ws_connected()) {
             was_linked = false;
+            samples_paused = false;
             int64_t now = esp_timer_get_time();
             if (disconnect_since == 0) disconnect_since = now;
             if (unlink_since == 0) unlink_since = now;
@@ -126,25 +132,27 @@ static void app_task(void *arg)
         ui_set_linked(true);
         if (!was_linked) {
             net_ws_status_t st0 = net_ws_status();
-            ESP_LOGI(TAG, "ws linked (reconnects=%lu send_fails=%lu)",
+            ESP_LOGI(TAG, "ws linked (reconnects=%lu send_fails=%lu boot=%08lx)",
                      (unsigned long)st0.reconnects,
-                     (unsigned long)st0.send_fails);
-            net_ws_send_status();
+                     (unsigned long)st0.send_fails,
+                     (unsigned long)st0.boot_id);
+            samples_paused = false;
         }
         was_linked = true;
 
+        net_ws_service();
         net_ws_status_t st = net_ws_status();
-        int64_t now = esp_timer_get_time();
-        if (now - last_status > 2000000) {
-            net_ws_send_status();
-            last_status = now;
+        if (!st.busy) {
+            samples_paused = false;
         }
 
-        if ((now - last_send) >= (1000000 / RMC_SEND_HZ)) {
+        int64_t now = esp_timer_get_time();
+        if (!samples_paused && st.hello_ok &&
+            (now - last_send) >= (1000000 / RMC_SEND_HZ)) {
             imu_integrate_state_t imu;
             imu_get_state(&imu);
             bool engaged = ui_engaged() && imu.ready && !st.busy;
-            net_ws_send_state(&imu, engaged, ui_get_gain(), seq++);
+            net_ws_send_sample(&imu, engaged, ui_get_gain(), seq++);
             last_send = now;
 
 #if CONFIG_RMC_TRACE

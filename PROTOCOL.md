@@ -1,10 +1,14 @@
-# Motion Controller WebSocket Protocol
+# Motion Controller WebSocket Protocol v2
 
 Cross-repo contract between the ESP32 firmware and the Reachy Mini Python app.
 When this document changes, update in the same change:
 
 - `firmware/main/net_ws.c`
-- `reachy-mini-app/esp32_motion_controller/ws_handler.py`
+- `reachy-mini-app/esp32_motion_controller/protocol.py`
+- `reachy-mini-app/esp32_motion_controller/session.py`
+
+**Major version 2 is required on both sides.** Mixed v1/v2 pairs must fail visibly.
+There is no compatibility adapter.
 
 ## Transport
 
@@ -15,6 +19,7 @@ When this document changes, update in the same change:
 | Framing | JSON text frames |
 | Discovery | mDNS service `_reachyctl._tcp.local.` (port 8766) |
 | Fallback | `CONFIG_RMC_ROBOT_HOST` compiled override |
+| Threat model | Trusted LAN only — no auth, plain `ws://` |
 
 Port **8766** is intentional so this app can coexist with `spectacles_reachy_mini` on 8765.
 
@@ -23,17 +28,72 @@ Port **8766** is intentional so this app can coexist with `spectacles_reachy_min
 | Path | Rate |
 |------|------|
 | ESP32 IMU fusion / ZUPT integration | 250 Hz (on device) |
-| ESP32 → Python `controller_state` | 20 Hz |
-| Python apply / LERP loop | ~30 Hz |
-| Python → Reachy Mini daemon `set_target` | 20 Hz |
+| ESP32 → Python `sample` | 20 Hz fire-and-forget, latest-value |
+| Python control / SDK command loop | 20 Hz fixed-rate, one SDK call in flight |
 
-## Messages: ESP32 → Python
+A blocked send may lower the telemetry rate. The device must never queue catch-up samples.
+Host SDK latency may lower the command rate. The host must never accumulate sample backlog.
 
-### `controller_state` (20 Hz, fire-and-forget)
+## Frame limits
+
+| Direction | Max UTF-8 bytes |
+|-----------|-----------------|
+| Device → host | 512 |
+| Host → device | 512 |
+
+Malformed, oversize, or non-finite numeric frames are rejected. The host replies with
+`error` when a request expected a response; fire-and-forget `sample` frames are dropped
+silently after logging.
+
+## Handshake
+
+On WebSocket connect the device sends:
 
 ```json
 {
-  "type": "controller_state",
+  "type": "hello",
+  "protocol_version": 2,
+  "boot_id": "a1b2c3d4",
+  "device": "esp32-reachy-ctl"
+}
+```
+
+| Field | Notes |
+|-------|-------|
+| `protocol_version` | Integer major version; must be `2` |
+| `boot_id` | Opaque string unique per device reboot (hex or decimal) |
+| `device` | Informative identifier |
+
+The host replies:
+
+```json
+{
+  "type": "hello",
+  "protocol_version": 2,
+  "session_id": 7
+}
+```
+
+If the host receives a missing/unsupported major version it closes the socket after:
+
+```json
+{
+  "type": "error",
+  "request_type": "hello",
+  "message": "unsupported protocol_version"
+}
+```
+
+Immediately after a successful hello the host pushes a `host_state` snapshot.
+
+## Messages: ESP32 → Python
+
+### `sample` (20 Hz, fire-and-forget)
+
+```json
+{
+  "type": "sample",
+  "boot_id": "a1b2c3d4",
   "seq": 412,
   "q": [0.99, 0.01, -0.13, 0.02],
   "p": [0.004, -0.011, 0.002],
@@ -45,54 +105,79 @@ Port **8766** is intentional so this app can coexist with `spectacles_reachy_min
 
 | Field | Type | Units / notes |
 |-------|------|---------------|
-| `seq` | int | Monotonic packet counter |
+| `boot_id` | string | Same as hello; host rejects mismatch for the session |
+| `seq` | uint32 | Monotonic per boot; wraps; used for duplicate/reorder detection |
 | `q` | `[w, x, y, z]` | Unit quaternion, body→world (gravity-aligned Mahony fusion) |
 | `p` | `[x, y, z]` | metres; ZUPT-aided displacement in the **world** frame |
 | `engaged` | bool | True only while the face is held (touch engage) |
-| `gain` | float | Motion multiplier in `[0.1, 3.0]` (scales rotation; also multiplies translation) |
+| `gain` | float | Motion multiplier in `[0.1, 3.0]` |
 | `ready` | bool | False until gyro bias calibration succeeds |
 
-Python refuses to engage while `ready` is false.
+There is **no per-sample acknowledgement**. The host keeps only the latest valid sample.
+
+While a reset is in progress the device may pause `sample` frames. The host treats a
+300 ms gap (by host receipt time) as stale regardless.
 
 ### `reset` (on demand)
 
 ```json
-{ "type": "reset", "_id": 7 }
+{
+  "type": "reset",
+  "boot_id": "a1b2c3d4",
+  "op_id": 3
+}
 ```
 
-Response:
+| Field | Notes |
+|-------|-------|
+| `op_id` | Boot-scoped monotonic token; retries reuse the same token |
 
-```json
-{ "type": "reset_result", "success": true, "_id": 7 }
-```
-
-Triggers a 1.5 s minjerk `goto` to the neutral pose, then rebases the clutch.
-
-### `status` (on demand)
-
-```json
-{ "type": "status", "_id": 8 }
-```
+Responses use `reset_result` (below). Reset is idempotent: a second `reset` with the
+same `(boot_id, op_id)` returns the cached outcome and never starts a second goto.
 
 ## Messages: Python → ESP32
 
-### `status_result`
+### `host_state` (event-driven)
+
+Sent on connect and whenever mode / robot readiness / error changes. Not polled.
 
 ```json
 {
-  "type": "status_result",
-  "connected": true,
+  "type": "host_state",
   "robot": true,
-  "busy": false,
-  "_id": 8
+  "mode": "idle",
+  "error": null
 }
 ```
 
 | Field | Meaning |
 |-------|---------|
-| `connected` | WebSocket session is live |
-| `robot` | Reachy Mini daemon / SDK is available |
-| `busy` | Reset `goto` in progress; Python ignores `engaged` |
+| `robot` | Reachy Mini daemon / SDK is available (or log-only) |
+| `mode` | `idle` \| `engaged` \| `resetting` \| `fault` |
+| `error` | Optional short string when `mode` is `fault` |
+
+The device gates outbound `engaged` false while `mode` is `resetting` or `fault`.
+
+### `reset_result`
+
+```json
+{
+  "type": "reset_result",
+  "boot_id": "a1b2c3d4",
+  "op_id": 3,
+  "status": "completed"
+}
+```
+
+| `status` | Meaning |
+|----------|---------|
+| `accepted` | Reset started (optional early ack; may be omitted) |
+| `completed` | SDK minjerk goto finished and pose rebased |
+| `failed` | Reset could not run or SDK failed |
+
+A replacement WebSocket after reconnect may re-query outcome by sending the same
+`reset` token; the host returns the cached `reset_result` without re-running the goto
+if that operation already finished.
 
 ### `error`
 
@@ -100,21 +185,37 @@ Triggers a 1.5 s minjerk `goto` to the neutral pose, then rebases the clutch.
 {
   "type": "error",
   "request_type": "reset",
-  "message": "...",
-  "_id": 7
+  "message": "..."
 }
 ```
 
 ## Connection policy
 
-- Single controller only: a second WebSocket client is refused with an explicit error.
-- If no `controller_state` arrives for 300 ms, Python treats the controller as disengaged and freezes the target pose.
-- On reconnect, the first `engaged: true` is a fresh rising edge and re-snapshots the clutch reference.
+- Single active controller session. A new WebSocket **replaces** a stale one (ESP
+  auto-reconnect); the previous socket is closed. Session generation increments so
+  callbacks from the old socket cannot mutate the active session.
+- If no valid `sample` arrives for **300 ms** (host monotonic receipt time), the host
+  force-disengages (commits clutch) and freezes the last safe command.
+- On reconnect, the host seeds from the measured robot pose before accepting control.
+  The first `engaged: true` after a seed / stale gap is a fresh rising edge.
+- Sequence: ignore duplicates (`seq == last`); accept wrap only after a large backward
+  jump consistent with uint32 wrap or a new `boot_id`/session.
+
+## Reset semantics
+
+1. Device may pause samples and sends `reset` with a new `op_id`.
+2. Host enters `mode=resetting`, force-disengages, rebases clutch toward neutral intent.
+3. Host runs blocking `goto_target(..., method="minjerk", duration=1.5)` off the event
+   loop. No concurrent `set_target`.
+4. Host reads measured pose, rebases baselines, pushes `host_state` (`idle`), and sends
+   `reset_result` with `status=completed` or `failed`.
+5. Disconnect during reset does **not** cancel the robot motion by dropping an executor
+   future. Outcome is cached by `(boot_id, op_id)`.
 
 ## Axis convention
 
-Device (landscape, screen facing user, USB + buttons facing down): `X` right, `Y` up, `Z` out of screen.
-The screen *is* Reachy's face.
+Device (landscape, screen facing user, USB + buttons facing down): `X` right, `Y` up,
+`Z` out of screen. The screen *is* Reachy's face.
 
 Robot head frame: `x` forward, `y` left, `z` up.
 
@@ -137,3 +238,15 @@ M = [[0, 0, 1],   # head_x ← device_z  (face)
 | +X displacement (right) | +y |
 | +Y displacement (up) | +z |
 | +Z displacement (toward user) | +x |
+
+## Cutover / rollback
+
+Flash firmware and upgrade the Python app **together**.
+
+| Pair | Result |
+|------|--------|
+| FW v2 + app v2 | Supported |
+| FW v1 + app v2 | Hello fails / no `controller_state` handler — non-functional |
+| FW v2 + app v1 | App does not understand `sample`/`hello` — non-functional |
+
+Rollback: reflash previous firmware image and reinstall previous app wheel/commit as a pair.

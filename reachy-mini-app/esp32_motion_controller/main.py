@@ -1,14 +1,13 @@
 """
-Motion Controller Reachy Mini app entry point.
+Motion Controller Reachy Mini app entry point (protocol v2).
 
-FastAPI/uvicorn on port 8766, mDNS advertise _reachyctl._tcp, clutch + behavior bridge.
+FastAPI/uvicorn on port 8766, mDNS advertise _reachyctl._tcp, clutch + safety bridge.
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
-import os
 import socket
 import sys
 import threading
@@ -20,29 +19,15 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from esp32_motion_controller.behavior import Behavior
-from esp32_motion_controller.controller_state import ControllerState
-from esp32_motion_controller.movement_handler import MovementHandler
-from esp32_motion_controller.ws_handler import WebSocketHandler
+from esp32_motion_controller.robot_control import RobotControl, RobotGateway
+from esp32_motion_controller.session import SessionHub
 
 logger = logging.getLogger(__name__)
 
 WS_PORT = 8766
 STATIC_DIR = Path(__file__).parent / "static"
 MDNS_SERVICE_TYPE = "_reachyctl._tcp.local."
-ENV_SEND_RATE_HZ = "REACHY_MOTION_SEND_RATE_HZ"
-DEFAULT_SEND_RATE_HZ = 20.0
 SERVER_START_TIMEOUT_S = 10.0
-
-
-def _get_send_rate_hz() -> float:
-    raw = os.environ.get(ENV_SEND_RATE_HZ)
-    if raw is None or raw.strip() == "":
-        return DEFAULT_SEND_RATE_HZ
-    try:
-        return max(5.0, min(50.0, float(raw.strip())))
-    except ValueError:
-        return DEFAULT_SEND_RATE_HZ
 
 
 def get_local_ips() -> list[str]:
@@ -89,14 +74,10 @@ class MdnsAdvertiser:
                 f"esp32-motion-controller.{MDNS_SERVICE_TYPE}",
                 addresses=[socket.inet_aton(ip) for ip in ips],
                 port=self.port,
-                properties={"path": b"/ws"},
+                properties={"path": b"/ws", "protocol": b"2"},
                 server="esp32-motion.local.",
             )
             zc = Zeroconf()
-            # An advertisement from a previous run lingers in the mDNS cache for
-            # the record TTL (75 min), so a restart collides with itself.
-            # Renaming is safe: the controller browses the service type, never
-            # the instance name.
             zc.register_service(info, allow_name_change=True)
         except Exception:
             logger.warning(
@@ -136,35 +117,41 @@ def create_app(
     log_only: bool = False,
 ) -> FastAPI:
     app = FastAPI(title="ESP32 Motion Controller")
-    send_rate = _get_send_rate_hz()
     robot_available = reachy_mini is not None and not log_only
-    movement = MovementHandler(reachy_mini, send_rate_hz=send_rate)
-    controller = ControllerState()
-    behavior = Behavior()
-    ws_handler = WebSocketHandler(
-        movement,
-        controller,
-        behavior,
-        robot_available=robot_available or log_only,
+    session = SessionHub(robot_available=robot_available or log_only)
+    gateway = RobotGateway(reachy_mini, log_only=log_only)
+    control = RobotControl(
+        session,
+        gateway,
+        robot_available=robot_available,
         log_only=log_only,
     )
-    app.state.ws_handler = ws_handler
+    app.state.session = session
+    app.state.control = control
+
+    @app.on_event("startup")
+    async def _startup() -> None:
+        control.start()
+
+    @app.on_event("shutdown")
+    async def _shutdown() -> None:
+        await control.stop()
 
     @app.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket) -> None:
-        admitted = await ws_handler.on_connect(websocket)
-        if not admitted:
-            return
+        generation = await session.on_connect(websocket)
+        await control.on_controller_connected()
         try:
             while not stop_event.is_set():
                 raw = await websocket.receive_text()
-                await ws_handler.handle_message(websocket, raw)
+                await session.handle_message(websocket, generation, raw)
         except WebSocketDisconnect:
             logger.info("WebSocket disconnect")
         except Exception as exc:
             logger.error("WebSocket error: %s", exc)
         finally:
-            ws_handler.cleanup(websocket)
+            await session.cleanup(websocket, generation)
+            await control.on_controller_disconnected()
 
     @app.get("/api/info")
     async def info() -> JSONResponse:
@@ -175,17 +162,22 @@ def create_app(
                 "port": WS_PORT,
                 "ws_url": f"ws://{ips[0]}:{WS_PORT}/ws" if ips else None,
                 "mdns": MDNS_SERVICE_TYPE,
+                "protocol_version": 2,
             }
         )
 
     @app.get("/api/status")
     async def status() -> JSONResponse:
+        snap = await session.snapshot_status()
         return JSONResponse(
             {
                 "status": "ok",
                 "robot": robot_available or log_only,
-                "busy": ws_handler.busy,
+                "busy": snap["busy"],
+                "mode": snap["mode"],
+                "connected": snap["connected"],
                 "log_only": log_only,
+                "protocol_version": 2,
             }
         )
 
@@ -200,7 +192,7 @@ def create_app(
 def _run_server(reachy_mini, stop_event: threading.Event, *, log_only: bool) -> None:
     ips = get_local_ips()
     logger.info("=" * 50)
-    logger.info("ESP32 Motion Controller")
+    logger.info("ESP32 Motion Controller (protocol v2)")
     logger.info("=" * 50)
     for ip in ips:
         logger.info("  WebSocket: ws://%s:%d/ws", ip, WS_PORT)
@@ -209,15 +201,11 @@ def _run_server(reachy_mini, stop_event: threading.Event, *, log_only: bool) -> 
     logger.info("=" * 50)
 
     app = create_app(reachy_mini, stop_event, log_only=log_only)
-    # Stash for shutdown — create_app closes over the handler.
-    ws_handler: WebSocketHandler = app.state.ws_handler  # type: ignore[attr-defined]
     config = uvicorn.Config(app, host="0.0.0.0", port=WS_PORT, log_level="info")
     server = uvicorn.Server(config)
     thread = threading.Thread(target=server.run, daemon=True)
     thread.start()
 
-    # A failed bind only kills the server thread, so without this the app would
-    # sit here advertising a port nothing listens on.
     deadline = time.monotonic() + SERVER_START_TIMEOUT_S
     while not server.started and thread.is_alive() and time.monotonic() < deadline:
         time.sleep(0.05)
@@ -227,12 +215,11 @@ def _run_server(reachy_mini, stop_event: threading.Event, *, log_only: bool) -> 
             f"instance is probably already running"
         )
 
-    # Advertise only once we are actually listening.
     mdns = MdnsAdvertiser(WS_PORT)
     mdns.start()
 
     stop_event.wait()
-    ws_handler.shutdown()
+    # Shutdown path: uvicorn will fire FastAPI shutdown hooks.
     server.should_exit = True
     thread.join(timeout=5)
     mdns.stop()

@@ -16,9 +16,9 @@ tags:
 
 # ESP32 Motion Controller
 
-WebSocket bridge for an ESP32 handheld IMU controller that drives Reachy Mini's head with clutch-style relative motion, IK-safe clamping, antenna idle animation, and body follow only when head exceeds the neck yaw threshold.
+WebSocket bridge (protocol v2) for an ESP32 handheld IMU controller that drives Reachy Mini's head with clutch-style relative motion, IK-safe clamping, antenna idle animation, and body follow only when head exceeds the neck yaw threshold.
 
-See the [repository README](https://github.com/V4C38/esp32-reachy-mini-controller) and [`PROTOCOL.md`](../PROTOCOL.md).
+See the [repository README](https://github.com/V4C38/esp32-reachy-mini-controller) and [`PROTOCOL.md`](../PROTOCOL.md). Firmware and app must both speak protocol v2.
 
 ## Local install
 
