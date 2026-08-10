@@ -1,0 +1,28 @@
+body {
+  padding: 2rem;
+  font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+  background: linear-gradient(160deg, #edebe6 0%, #d8d4cc 100%);
+  color: #1c1b19;
+}
+
+h1 {
+  font-size: 1.5rem;
+  margin-top: 0;
+}
+
+p {
+  color: #3f3c38;
+  font-size: 1rem;
+  line-height: 1.45;
+}
+
+code {
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 0.9em;
+}
+
+.card {
+  max-width: 620px;
+  margin: 0 auto;
+  padding: 1.25rem 1.5rem;
+}

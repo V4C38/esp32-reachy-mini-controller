@@ -1,0 +1,208 @@
+#include <stdio.h>
+#include <string.h>
+
+#include "config.h"
+#include "esp_log.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#include "bsp/esp-bsp.h"
+#include "imu.h"
+#include "net_discovery.h"
+#include "net_wifi.h"
+#include "net_ws.h"
+#include "pmu.h"
+#include "ui.h"
+
+static const char *TAG = "main";
+
+/* Debounce eyes-closed / unlink so the client's internal reconnect blips
+ * do not thrash brightness and face mode. */
+#define LINK_DOWN_DEBOUNCE_US 1500000
+
+static void imu_task(void *arg)
+{
+    (void)arg;
+    const TickType_t period = pdMS_TO_TICKS(1000 / RMC_IMU_HZ);
+    TickType_t last = xTaskGetTickCount();
+    int64_t prev_us = esp_timer_get_time();
+    while (true) {
+        vTaskDelayUntil(&last, period);
+        int64_t now = esp_timer_get_time();
+        float dt = (now - prev_us) / 1e6f;
+        prev_us = now;
+        imu_update(dt);
+    }
+}
+
+static void app_task(void *arg)
+{
+    (void)arg;
+    char host[64] = {0};
+    uint16_t port = RMC_WS_PORT;
+    uint32_t seq = 0;
+    int64_t last_send = 0;
+    int64_t last_status = 0;
+    int64_t last_connect_attempt = 0;
+    int64_t disconnect_since = 0;
+    int64_t unlink_since = 0;
+    bool was_linked = false;
+    bool have_host = false;
+
+    ESP_LOGI(TAG, "app_task started");
+
+    while (true) {
+        /* Drained every pass: while offline the request is simply dropped so
+         * it can't fire late once the app comes back. */
+        if (ui_take_reset_request()) {
+            if (net_ws_connected()) net_ws_send_reset();
+            else ESP_LOGI(TAG, "reset ignored — app not linked");
+        }
+
+        if (!net_wifi_connected()) {
+            have_host = false;
+            disconnect_since = 0;
+            unlink_since = 0;
+            if (net_ws_running()) net_ws_stop();
+            ui_set_linked(false);
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
+
+        if (!net_ws_connected()) {
+            was_linked = false;
+            int64_t now = esp_timer_get_time();
+            if (disconnect_since == 0) disconnect_since = now;
+            if (unlink_since == 0) unlink_since = now;
+
+            /* Debounce UI unlink — keep eyes open during short reconnects. */
+            if ((now - unlink_since) >= LINK_DOWN_DEBOUNCE_US) {
+                ui_set_linked(false);
+            }
+
+            /* Let the client's internal reconnect run. Only tear it down and
+             * re-browse mDNS after a long outage — short blips are normal. */
+            if (net_ws_running()) {
+                if ((now - disconnect_since) < 30000000) {
+                    vTaskDelay(pdMS_TO_TICKS(200));
+                    continue;
+                }
+                ESP_LOGW(TAG, "ws still down — re-resolving host");
+                net_ws_stop();
+                have_host = false;
+                disconnect_since = now;
+            }
+
+            if (now - last_connect_attempt < 2000000) {
+                vTaskDelay(pdMS_TO_TICKS(100));
+                continue;
+            }
+            last_connect_attempt = now;
+
+            if (!have_host) {
+                if (!net_discovery_resolve(host, sizeof(host), &port)) {
+                    ESP_LOGW(TAG, "host resolve failed");
+                    vTaskDelay(pdMS_TO_TICKS(1000));
+                    continue;
+                }
+                have_host = true;
+            }
+
+            ESP_LOGI(TAG, "connecting ws://%s:%u/ws", host, (unsigned)port);
+            if (net_ws_start(host, port) != ESP_OK) {
+                ESP_LOGW(TAG, "ws start failed");
+                have_host = false;
+                vTaskDelay(pdMS_TO_TICKS(1000));
+            }
+            continue;
+        }
+
+        disconnect_since = 0;
+        unlink_since = 0;
+
+        /* Eyes open once the controller app is reachable — the robot SDK being
+         * "not ready" is reported separately and doesn't close them. */
+        ui_set_linked(true);
+        if (!was_linked) {
+            net_ws_status_t st0 = net_ws_status();
+            ESP_LOGI(TAG, "ws linked (reconnects=%lu send_fails=%lu)",
+                     (unsigned long)st0.reconnects,
+                     (unsigned long)st0.send_fails);
+            net_ws_send_status();
+        }
+        was_linked = true;
+
+        net_ws_status_t st = net_ws_status();
+        int64_t now = esp_timer_get_time();
+        if (now - last_status > 2000000) {
+            net_ws_send_status();
+            last_status = now;
+        }
+
+        if ((now - last_send) >= (1000000 / RMC_SEND_HZ)) {
+            imu_integrate_state_t imu;
+            imu_get_state(&imu);
+            bool engaged = ui_engaged() && imu.ready && !st.busy;
+            net_ws_send_state(&imu, engaged, ui_get_gain(), seq++);
+            last_send = now;
+
+#if CONFIG_RMC_TRACE
+            {
+                float a[3], g[3];
+                imu_get_raw_mapped(a, g);
+                printf("RMC_TRACE,%lld,"
+                       "%.5f,%.5f,%.5f,%.5f,"
+                       "%.5f,%.5f,%.5f,"
+                       "%.4f,%.4f,%.4f,"
+                       "%.4f,%.4f,%.4f,"
+                       "%d,%d\n",
+                       (long long)(now / 1000),
+                       imu.q[0], imu.q[1], imu.q[2], imu.q[3],
+                       imu.p[0], imu.p[1], imu.p[2],
+                       a[0], a[1], a[2],
+                       g[0], g[1], g[2],
+                       imu.still ? 1 : 0, engaged ? 1 : 0);
+            }
+#endif
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+void app_main(void)
+{
+    ESP_LOGI(TAG, "Reachy Motion Controller");
+
+    ESP_ERROR_CHECK(ui_init());
+
+    i2c_master_bus_handle_t i2c = bsp_i2c_get_handle();
+    if (!i2c) {
+        ESP_ERROR_CHECK(bsp_i2c_init());
+        i2c = bsp_i2c_get_handle();
+    }
+
+    if (pmu_init(i2c) != ESP_OK) {
+        ESP_LOGW(TAG, "PMU init skipped — connect a LiPo for untethered use");
+    }
+
+    if (imu_init(i2c) != ESP_OK) {
+        ESP_LOGW(TAG, "IMU init failed — motion disabled until ready");
+    }
+
+    if (net_wifi_start() != ESP_OK) {
+        ESP_LOGE(TAG, "WiFi failed — check sdkconfig.local");
+    } else {
+        ESP_LOGI(TAG, "WiFi up, starting tasks");
+    }
+    /* WiFi RF bring-up (and the USB-UART RTS reset that usually precedes a
+     * flash/monitor session) blank the CO5300. Re-assert before tasks run. */
+    ui_reassert_panel();
+    ESP_ERROR_CHECK(net_discovery_init());
+
+    /* IMU on core 0 with WiFi/app — LVGL owns core 1 so flush waits are not
+     * starved by the 250 Hz integrator. */
+    xTaskCreatePinnedToCore(imu_task, "imu", 4096, NULL, 4, NULL, 0);
+    xTaskCreatePinnedToCore(app_task, "app", 8192, NULL, 5, NULL, 0);
+}

@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "esp32_motion_controller"
+version = "1.0.0"
+description = "ESP32 Motion Controller — handheld IMU controller for Reachy Mini"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "reachy-mini",
+    "fastapi",
+    "uvicorn[standard]",
+    "numpy",
+    "scipy",
+    "zeroconf",
+]
+keywords = ["reachy-mini-app"]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio", "httpx", "websockets"]
+
+[project.entry-points."reachy_mini_apps"]
+esp32_motion_controller = "esp32_motion_controller.main:Esp32MotionController"
+
+[tool.setuptools]
+package-dir = { "" = "." }
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["esp32_motion_controller*"]
+exclude = ["build*", "dist*", "tools*", "tests*"]
+
+[tool.setuptools.package-data]
+esp32_motion_controller = ["static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["../tools/tests"]
+pythonpath = ["."]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"

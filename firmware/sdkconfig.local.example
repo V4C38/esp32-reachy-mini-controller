@@ -1,0 +1,5 @@
+# Copy to sdkconfig.local and fill in (sdkconfig.local is gitignored).
+CONFIG_RMC_WIFI_SSID="your-ssid"
+CONFIG_RMC_WIFI_PASSWORD="your-password"
+# Optional fixed host instead of mDNS:
+# CONFIG_RMC_ROBOT_HOST="192.168.1.10"

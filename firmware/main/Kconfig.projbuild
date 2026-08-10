@@ -1,0 +1,27 @@
+menu "Reachy Motion Controller"
+
+config RMC_WIFI_SSID
+    string "WiFi SSID"
+    default ""
+    help
+        SSID of the local network. Must be set in sdkconfig.local.
+
+config RMC_WIFI_PASSWORD
+    string "WiFi password"
+    default ""
+
+config RMC_ROBOT_HOST
+    string "Robot host override (IP or hostname)"
+    default ""
+    help
+        If empty, resolve via mDNS _reachyctl._tcp.
+
+config RMC_ROBOT_PORT
+    int "Robot WebSocket port"
+    default 8766
+
+config RMC_TRACE
+    bool "Emit structured RMC_TRACE serial lines"
+    default n
+
+endmenu

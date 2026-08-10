@@ -1,0 +1,42 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.mypy_cache/
+dist/
+build/
+*.egg
+
+# ESP-IDF
+firmware/build/
+firmware/sdkconfig
+firmware/sdkconfig.old
+firmware/sdkconfig.local
+firmware/dependencies.lock
+firmware/managed_components/
+
+# Host IMU sim build output
+tools/imu-sim/out/
+tools/imu-sim/*.o
+
+# Local secrets / credentials
+*.local
+!*.local.example
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# Captured traces
+tools/imu-sim/traces/*.csv
+!tools/imu-sim/traces/.gitkeep
+reachy-mini-app/.venv/
+tools/.loopback_app.log
+*.pyc
