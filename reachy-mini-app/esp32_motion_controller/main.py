@@ -49,6 +49,71 @@ def get_local_ips() -> list[str]:
     return list(dict.fromkeys(ips))
 
 
+class UdpAdvertiser:
+    """Answer ESP32 subnet-broadcast probes on UDP WS_PORT.
+
+    Dual-band APs commonly forward unicast/broadcast while dropping mDNS
+    multicast between 2.4 GHz (ESP32-S3) and 5 GHz (desktop).
+    """
+
+    def __init__(self, port: int = WS_PORT) -> None:
+        self.port = port
+        self._sock: socket.socket | None = None
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+
+    def start(self) -> None:
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            sock.bind(("0.0.0.0", self.port))
+            sock.settimeout(0.5)
+        except OSError:
+            logger.warning("UDP discovery bind failed on port %d", self.port, exc_info=True)
+            return
+        self._sock = sock
+        self._thread = threading.Thread(target=self._loop, name="udp-discovery", daemon=True)
+        self._thread.start()
+        logger.info("UDP discovery listening on 0.0.0.0:%d", self.port)
+
+    def _loop(self) -> None:
+        sock = self._sock
+        if sock is None:
+            return
+        while not self._stop.is_set():
+            try:
+                data, addr = sock.recvfrom(64)
+            except TimeoutError:
+                continue
+            except OSError:
+                if self._stop.is_set():
+                    return
+                continue
+            if not data.startswith(b"RMC2?"):
+                continue
+            ips = get_local_ips()
+            if not ips:
+                continue
+            reply = f"RMC2 {ips[0]} {self.port}".encode()
+            try:
+                sock.sendto(reply, addr)
+            except OSError:
+                pass
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+        self._sock = None
+        self._thread = None
+
+
 class MdnsAdvertiser:
     def __init__(self, port: int = WS_PORT) -> None:
         self.port = port
@@ -217,11 +282,14 @@ def _run_server(reachy_mini, stop_event: threading.Event, *, log_only: bool) -> 
 
     mdns = MdnsAdvertiser(WS_PORT)
     mdns.start()
+    udp = UdpAdvertiser(WS_PORT)
+    udp.start()
 
     stop_event.wait()
     # Shutdown path: uvicorn will fire FastAPI shutdown hooks.
     server.should_exit = True
     thread.join(timeout=5)
+    udp.stop()
     mdns.stop()
     logger.info("Motion Controller stopped")
 
