@@ -41,7 +41,6 @@ static bool s_qref_valid;
 static float s_mx, s_my, s_mr;
 static int s_brightness = -1;
 static int s_brightness_pending = -1;
-static uint32_t s_keepalive_ms;
 
 static float clamp1(float v)
 {
@@ -122,28 +121,6 @@ static void apply_brightness(void)
 {
     request_brightness();
     flush_brightness();
-}
-
-/* Must run under the LVGL lock (timer context or bsp_display_lock). */
-static void panel_keepalive(void)
-{
-    /* Brightness alone is not enough — after USB RTS / WiFi the CO5300 can
-     * lose Sleep-Out / Display-On while GRAM is empty. */
-    (void)bsp_display_reassert();
-    s_brightness = -1;
-    request_brightness();
-    flush_brightness();
-    lv_obj_invalidate(lv_screen_active());
-}
-
-void ui_reassert_panel(void)
-{
-    if (!bsp_display_lock(500)) {
-        ESP_LOGW(TAG, "panel reassert: LVGL lock timeout");
-        return;
-    }
-    panel_keepalive();
-    bsp_display_unlock();
 }
 
 static void apply_face(void)
@@ -303,20 +280,9 @@ static void ui_timer_cb(lv_timer_t *t)
     }
 
     /* Skip high-rate motion invalidates while settings are open or offline —
-     * those used to starve the QSPI path. Still keep the panel alive: after
-     * USB-UART RTS resets / WiFi bring-up the CO5300 can lose Sleep-Out,
-     * Display-On, GRAM and brightness while the MCU still thinks the last
-     * frame is on screen. */
+     * those used to starve the QSPI path. */
     if (!s_settings && s_linked) {
         motion_update();
-        /* DISPON is cheap; covers a mid-session serial open that blanked us. */
-        if (now - s_keepalive_ms >= 2000) {
-            s_keepalive_ms = now;
-            (void)bsp_display_reassert();
-        }
-    } else if (now - s_keepalive_ms >= 1000) {
-        s_keepalive_ms = now;
-        panel_keepalive();
     }
 }
 

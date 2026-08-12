@@ -81,16 +81,6 @@ esp_err_t bsp_display_brightness_init(void);
 esp_err_t bsp_display_brightness_set(int brightness_percent);
 
 /**
- * @brief Re-assert Sleep-Out + Display-On on the CO5300
- *
- * USB-UART RTS/DTR resets (idf.py flash/monitor, esptool, pyserial setRTS)
- * and WiFi RF bring-up can drop the panel out of the active display state
- * while the MCU still believes the last frame is on screen. Safe to call
- * from the LVGL task; serializes with flushes via the LVGL lock.
- */
-esp_err_t bsp_display_reassert(void);
-
-/**
  * @brief Turn on display backlight
  *
  * Brightness is controlled with PWM signal to a pin controlling backlight.

@@ -65,9 +65,11 @@ idf.py -p /dev/cu.usbmodem101 flash monitor
 
 Keeping `monitor` attached after flashing is the proper way to verify a flash: you should see `UI ready`, the IMU calibration line `mapped accel [...]` (≈ `[0 0 +9.8]` when the board lies flat on the desk), `host hello ok (protocol 2)`, and the face should appear within two seconds.
 
-### Black screen (known failure mode)
+This board's Type-C port is the ESP32-S3's native USB, not a USB-UART bridge. `idf.py monitor` pulses DTR/RTS, which **resets the whole chip** — the panel is re-initialized from scratch on the next boot. To attach a logger without rebooting, use `idf.py monitor --no-reset`.
 
-If the AMOLED goes black and only recovers after a reset (USB RTS / board reset / power cycle), check the serial log for:
+### Black screen (DMA heap)
+
+If the AMOLED goes black and only recovers after a reset, check the serial log for:
 
 ```text
 E (…) spi_master: setup_dma_priv_buffer(…): Failed to allocate priv TX buffer
@@ -75,7 +77,7 @@ E (…) lcd_panel.io.spi: panel_io_spi_tx_color(…): spi transmit (queue) color
 E (…) co5300_spi: panel_co5300_draw_bitmap(…): send color data failed
 ```
 
-**Cause:** LVGL framebuffers live in PSRAM, so each QSPI flush copies a strip into an *internal* DMA bounce buffer. The SPI bus was configured with a full-frame `max_transfer_sz`, so those bounce allocs were ~70 KB+. After WiFi + the WebSocket stack came up, internal DMA heap was exhausted (`setup_dma_priv_buffer` failed), `draw_bitmap` never queued a transfer, the flush completion callback never ran, and the UI froze on a black panel until reboot.
+**Cause:** LVGL framebuffers live in PSRAM, so each QSPI flush copies a strip into an *internal* DMA bounce buffer. The stock Waveshare BSP configures the SPI bus with a full-frame `max_transfer_sz`, so those bounce allocs were ~70 KB+. After WiFi + the WebSocket stack came up, internal DMA heap was exhausted (`setup_dma_priv_buffer` failed), `draw_bitmap` never queued a transfer, the flush completion callback never ran, and the UI froze on a black panel until reboot.
 
 **Fix (already in this tree):**
 - Cap QSPI `max_transfer_sz` at 16 KB so bounce buffers stay small
@@ -84,7 +86,7 @@ E (…) co5300_spi: panel_co5300_draw_bitmap(…): send color data failed
 - Serialize brightness `tx_param` with the LVGL lock
 - Bounded flush wait recovers / restarts if a transfer never completes
 
-A related failure: the panel lights at boot, then goes black while the firmware keeps running (mDNS / WiFi logs, no SPI errors). That happens when the CO5300 loses Sleep-Out / Display-On / GRAM / brightness after USB-UART **RTS/DTR** resets and WiFi RF bring-up. Firmware reasserts Display-On after WiFi comes up, periodically while linked, and with a full brightness + redraw keepalive while offline.
+Do not replay Sleep-Out (`0x11`) after init. The CO5300 is initialized once; sending SLPOUT on an already-awake panel blanks GRAM (first frame flashes, then the screen stays black while the firmware keeps running).
 
 ### 4. Hold it right
 

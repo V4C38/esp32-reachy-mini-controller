@@ -61,7 +61,8 @@ Rotation remap lives in `control.py` (`DEV_TO_HEAD` + similarity transform).
 
 ## 6. Resource / display soak
 
-- [ ] No black screen across repeated `idf.py monitor` USB RTS cycles
+- [ ] No black screen after `idf.py flash` (with or without `monitor`)
+- [ ] `idf.py monitor --no-reset` can attach without blanking the panel
 - [ ] Engaged stream 10+ minutes: no flush timeout storms
 - [ ] Record heap/HWM into `tools/baselines/firmware_resources.md`
 

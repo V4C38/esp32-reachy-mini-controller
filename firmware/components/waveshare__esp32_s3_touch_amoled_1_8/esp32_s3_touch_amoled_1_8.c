@@ -439,27 +439,6 @@ esp_err_t bsp_display_brightness_set(int brightness_percent)
     return ESP_OK;
 }
 
-esp_err_t bsp_display_reassert(void)
-{
-    if (panel_handle == NULL || io_handle == NULL) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    /* QSPI command encoding matches brightness_set / the CO5300 panel IO. */
-    uint32_t slpout = ((uint32_t)0x11 << 8) | ((uint32_t)0x02 << 24);
-
-    lvgl_port_lock(0);
-    esp_err_t err = esp_lcd_panel_io_tx_param(io_handle, slpout, NULL, 0);
-    if (err == ESP_OK) {
-        err = esp_lcd_panel_disp_on_off(panel_handle, true);
-    }
-    lvgl_port_unlock();
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "panel reassert failed: %s", esp_err_to_name(err));
-    }
-    return err;
-}
-
 esp_err_t bsp_display_backlight_off(void)
 {
     ESP_LOGI(TAG, "Backlight off");
@@ -778,7 +757,7 @@ lv_display_t *bsp_display_start_with_config(const bsp_display_cfg_t *cfg)
     BSP_NULL_CHECK(disp = bsp_display_lcd_init(), NULL);
 
     /* Brightness before touch: the panel must be usable even if CST816S probe
-     * flakes (common right after USB RTS reset / flash). */
+     * flakes (common right after a chip reset / flash). */
     BSP_ERROR_CHECK_RETURN_NULL(bsp_display_brightness_init());
 
     disp_indev = bsp_display_indev_init(disp);

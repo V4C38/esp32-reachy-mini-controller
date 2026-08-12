@@ -204,9 +204,6 @@ void app_main(void)
     } else {
         ESP_LOGI(TAG, "WiFi up, starting tasks");
     }
-    /* WiFi RF bring-up (and the USB-UART RTS reset that usually precedes a
-     * flash/monitor session) blank the CO5300. Re-assert before tasks run. */
-    ui_reassert_panel();
     ESP_ERROR_CHECK(net_discovery_init());
 
     /* IMU on core 0 with WiFi/app — LVGL owns core 1 so flush waits are not
