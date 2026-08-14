@@ -22,7 +22,4 @@ CONFIG_LV_FONT_MONTSERRAT_18=y
 CONFIG_LV_FONT_MONTSERRAT_24=y
 CONFIG_LV_FONT_MONTSERRAT_48=y
 CONFIG_LV_USE_FONT_COMPRESSED=y
-# Separate TX lock so send_text does not contend with the client task, which
-# holds client->lock across esp_transport_connect (up to network_timeout_ms).
-CONFIG_ESP_WS_CLIENT_SEPARATE_TX_LOCK=y
 

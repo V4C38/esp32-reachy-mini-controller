@@ -4,11 +4,16 @@
 
 esp_err_t ui_init(void);
 
-/* Link state only selects the face artwork and the idle brightness. Touch,
- * hold-to-engage and the settings screen stay live while offline. */
+/* Link state drives the bottom-center status label: gray Starting... while
+ * booting, red DISCONNECTED once unlinked after boot, hidden when linked.
+ * Engage is toggled by the BOOT button (GPIO0); eyes follow engage. */
 void ui_set_linked(bool linked);
 bool ui_linked(void);
 
 bool ui_engaged(void);
-bool ui_take_reset_request(void);
 float ui_get_gain(void);
+
+/* Cross-core connect request (LVGL core 1 → app_task core 0).
+ * Forces host re-resolve; ignored if already linked. */
+bool ui_connect_pending(void);
+void ui_clear_connect_request(void);

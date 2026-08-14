@@ -1,12 +1,14 @@
 """
-Motion Controller Reachy Mini app entry point (protocol v2).
+Motion Controller Reachy Mini app entry point (protocol v4).
 
-FastAPI/uvicorn on port 8766, mDNS advertise _reachyctl._tcp, clutch + safety bridge.
+FastAPI/uvicorn HTTP on TCP 8766, UDP datagrams on UDP 8766,
+mDNS advertise _reachyctl._tcp, clutch + safety bridge.
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import logging
 import socket
 import sys
@@ -15,19 +17,22 @@ import time
 from pathlib import Path
 
 import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from esp32_motion_controller.protocol import PROTOCOL_VERSION
 from esp32_motion_controller.robot_control import RobotControl, RobotGateway
 from esp32_motion_controller.session import SessionHub
+from esp32_motion_controller import __version__
 
 logger = logging.getLogger(__name__)
 
-WS_PORT = 8766
+LINK_PORT = 8766
 STATIC_DIR = Path(__file__).parent / "static"
 MDNS_SERVICE_TYPE = "_reachyctl._tcp.local."
 SERVER_START_TIMEOUT_S = 10.0
+UDP_PROBE = b"RMC2?"
 
 
 def get_local_ips() -> list[str]:
@@ -49,73 +54,40 @@ def get_local_ips() -> list[str]:
     return list(dict.fromkeys(ips))
 
 
-class UdpAdvertiser:
-    """Answer ESP32 subnet-broadcast probes on UDP WS_PORT.
+class ControllerProtocol(asyncio.DatagramProtocol):
+    """One UDP socket: discovery probes + protocol v4 datagrams."""
 
-    Dual-band APs commonly forward unicast/broadcast while dropping mDNS
-    multicast between 2.4 GHz (ESP32-S3) and 5 GHz (desktop).
-    """
+    def __init__(self, session: SessionHub) -> None:
+        self.session = session
+        self.transport: asyncio.DatagramTransport | None = None
 
-    def __init__(self, port: int = WS_PORT) -> None:
-        self.port = port
-        self._sock: socket.socket | None = None
-        self._thread: threading.Thread | None = None
-        self._stop = threading.Event()
+    def connection_made(self, transport: asyncio.BaseTransport) -> None:
+        self.transport = transport  # type: ignore[assignment]
+        self.session.bind_transport(transport)
 
-    def start(self) -> None:
+    def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
+        if data.startswith(UDP_PROBE):
+            self._reply_probe(addr)
+            return
+        asyncio.create_task(self.session.handle_datagram(data, addr))
+
+    def error_received(self, exc: Exception) -> None:
+        logger.warning("UDP error: %s", exc)
+
+    def _reply_probe(self, addr: tuple[str, int]) -> None:
+        if self.transport is None:
+            return
+        ips = get_local_ips()
+        if not ips:
+            return
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-            sock.bind(("0.0.0.0", self.port))
-            sock.settimeout(0.5)
+            self.transport.sendto(f"RMC2 {ips[0]} {LINK_PORT}".encode(), addr)
         except OSError:
-            logger.warning("UDP discovery bind failed on port %d", self.port, exc_info=True)
-            return
-        self._sock = sock
-        self._thread = threading.Thread(target=self._loop, name="udp-discovery", daemon=True)
-        self._thread.start()
-        logger.info("UDP discovery listening on 0.0.0.0:%d", self.port)
-
-    def _loop(self) -> None:
-        sock = self._sock
-        if sock is None:
-            return
-        while not self._stop.is_set():
-            try:
-                data, addr = sock.recvfrom(64)
-            except TimeoutError:
-                continue
-            except OSError:
-                if self._stop.is_set():
-                    return
-                continue
-            if not data.startswith(b"RMC2?"):
-                continue
-            ips = get_local_ips()
-            if not ips:
-                continue
-            reply = f"RMC2 {ips[0]} {self.port}".encode()
-            try:
-                sock.sendto(reply, addr)
-            except OSError:
-                pass
-
-    def stop(self) -> None:
-        self._stop.set()
-        if self._sock is not None:
-            try:
-                self._sock.close()
-            except OSError:
-                pass
-        if self._thread is not None:
-            self._thread.join(timeout=2)
-        self._sock = None
-        self._thread = None
+            pass
 
 
 class MdnsAdvertiser:
-    def __init__(self, port: int = WS_PORT) -> None:
+    def __init__(self, port: int = LINK_PORT) -> None:
         self.port = port
         self._zc = None
         self._info = None
@@ -139,7 +111,7 @@ class MdnsAdvertiser:
                 f"esp32-motion-controller.{MDNS_SERVICE_TYPE}",
                 addresses=[socket.inet_aton(ip) for ip in ips],
                 port=self.port,
-                properties={"path": b"/ws", "protocol": b"2"},
+                properties={"protocol": b"3", "transport": b"udp"},
                 server="esp32-motion.local.",
             )
             zc = Zeroconf()
@@ -191,32 +163,27 @@ def create_app(
         robot_available=robot_available,
         log_only=log_only,
     )
+    session.on_hello = control.on_controller_hello
     app.state.session = session
     app.state.control = control
 
     @app.on_event("startup")
     async def _startup() -> None:
+        loop = asyncio.get_running_loop()
+        transport, _protocol = await loop.create_datagram_endpoint(
+            lambda: ControllerProtocol(session),
+            local_addr=("0.0.0.0", LINK_PORT),
+        )
+        app.state.udp_transport = transport
+        logger.info("UDP link listening on 0.0.0.0:%d", LINK_PORT)
         control.start()
 
     @app.on_event("shutdown")
     async def _shutdown() -> None:
         await control.stop()
-
-    @app.websocket("/ws")
-    async def websocket_endpoint(websocket: WebSocket) -> None:
-        generation = await session.on_connect(websocket)
-        await control.on_controller_connected()
-        try:
-            while not stop_event.is_set():
-                raw = await websocket.receive_text()
-                await session.handle_message(websocket, generation, raw)
-        except WebSocketDisconnect:
-            logger.info("WebSocket disconnect")
-        except Exception as exc:
-            logger.error("WebSocket error: %s", exc)
-        finally:
-            await session.cleanup(websocket, generation)
-            await control.on_controller_disconnected()
+        transport = getattr(app.state, "udp_transport", None)
+        if transport is not None:
+            transport.close()
 
     @app.get("/api/info")
     async def info() -> JSONResponse:
@@ -224,10 +191,10 @@ def create_app(
         return JSONResponse(
             {
                 "ips": ips,
-                "port": WS_PORT,
-                "ws_url": f"ws://{ips[0]}:{WS_PORT}/ws" if ips else None,
+                "port": LINK_PORT,
+                "udp": f"{ips[0]}:{LINK_PORT}" if ips else None,
                 "mdns": MDNS_SERVICE_TYPE,
-                "protocol_version": 2,
+                "protocol_version": PROTOCOL_VERSION,
             }
         )
 
@@ -242,7 +209,19 @@ def create_app(
                 "mode": snap["mode"],
                 "connected": snap["connected"],
                 "log_only": log_only,
-                "protocol_version": 2,
+                "protocol_version": PROTOCOL_VERSION,
+                "app_version": __version__,
+                "boot_id": snap["boot_id"],
+                "peer": snap["peer"],
+                "presents": snap["presents"],
+                "absents": snap["absents"],
+                "last_seq": snap["last_seq"],
+                "seq_skips": snap["seq_skips"],
+                "sample_gaps": snap["sample_gaps"],
+                "last_rx_age_ms": snap["last_rx_age_ms"],
+                "last_diag": snap["last_diag"],
+                "max_tick_lag_ms": snap["max_tick_lag_ms"],
+                "last_sdk_ms": snap["last_sdk_ms"],
             }
         )
 
@@ -257,16 +236,21 @@ def create_app(
 def _run_server(reachy_mini, stop_event: threading.Event, *, log_only: bool) -> None:
     ips = get_local_ips()
     logger.info("=" * 50)
-    logger.info("ESP32 Motion Controller (protocol v2)")
+    logger.info("ESP32 Motion Controller (protocol v4) app_version=%s", __version__)
     logger.info("=" * 50)
     for ip in ips:
-        logger.info("  WebSocket: ws://%s:%d/ws", ip, WS_PORT)
+        logger.info("  UDP: %s:%d", ip, LINK_PORT)
     if log_only:
         logger.info("  Mode: --log-only (no robot SDK calls)")
     logger.info("=" * 50)
 
     app = create_app(reachy_mini, stop_event, log_only=log_only)
-    config = uvicorn.Config(app, host="0.0.0.0", port=WS_PORT, log_level="info")
+    config = uvicorn.Config(
+        app,
+        host="0.0.0.0",
+        port=LINK_PORT,
+        log_level="info",
+    )
     server = uvicorn.Server(config)
     thread = threading.Thread(target=server.run, daemon=True)
     thread.start()
@@ -276,20 +260,16 @@ def _run_server(reachy_mini, stop_event: threading.Event, *, log_only: bool) -> 
         time.sleep(0.05)
     if not server.started:
         raise RuntimeError(
-            f"Could not serve on port {WS_PORT} — another Motion Controller "
+            f"Could not serve on port {LINK_PORT} — another Motion Controller "
             f"instance is probably already running"
         )
 
-    mdns = MdnsAdvertiser(WS_PORT)
+    mdns = MdnsAdvertiser(LINK_PORT)
     mdns.start()
-    udp = UdpAdvertiser(WS_PORT)
-    udp.start()
 
     stop_event.wait()
-    # Shutdown path: uvicorn will fire FastAPI shutdown hooks.
     server.should_exit = True
     thread.join(timeout=5)
-    udp.stop()
     mdns.stop()
     logger.info("Motion Controller stopped")
 

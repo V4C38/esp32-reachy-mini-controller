@@ -1,30 +1,25 @@
 #!/usr/bin/env python3
-"""End-to-end loopback against Motion Controller v2 (+ optional --log-only app start).
+"""End-to-end loopback against Motion Controller v4 (+ optional --log-only app start).
 
-Asserts hello handshake, reset completion, stale gap handling, and reconnect.
+Asserts hello reply, reset completion, stale gap handling, and resume after a gap.
 """
 
 from __future__ import annotations
 
 import argparse
-import asyncio
 import json
+import socket
 import subprocess
 import sys
 import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-
-try:
-    import websockets
-except ImportError:
-    print("pip install websockets", file=sys.stderr)
-    sys.exit(1)
-
 from scipy.spatial.transform import Rotation as R
 
 BOOT_ID = "loopback-boot"
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 8766
 
 
 def wxyz(roll: float, pitch: float, yaw: float) -> list[float]:
@@ -32,122 +27,126 @@ def wxyz(roll: float, pitch: float, yaw: float) -> list[float]:
     return [float(q[3]), float(q[0]), float(q[1]), float(q[2])]
 
 
-def sample(seq, q, p, engaged, gain=1.0, ready=True):
-    return {
-        "type": "sample",
+def sample(seq, q, engaged, gain=1.0, ready=True, op=None):
+    msg = {
+        "pv": 4,
         "boot_id": BOOT_ID,
         "seq": seq,
         "q": q,
-        "p": list(p),
         "engaged": engaged,
         "gain": gain,
         "ready": ready,
     }
+    if op is not None:
+        msg["op"] = op
+    return msg
 
 
-async def handshake(ws):
-    await ws.send(
-        json.dumps(
-            {
-                "type": "hello",
-                "protocol_version": 2,
-                "boot_id": BOOT_ID,
-                "device": "loopback",
-            }
-        )
-    )
-    hello = None
-    st = None
-    deadline = time.monotonic() + 2.0
-    while time.monotonic() < deadline and (hello is None or st is None):
-        msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=2.0))
-        if msg.get("type") == "hello":
-            hello = msg
-        elif msg.get("type") == "host_state":
-            st = msg
-    assert hello is not None and hello.get("protocol_version") == 2, hello
-    assert st is not None, st
+class UdpPeer:
+    def __init__(self, host: str, port: int) -> None:
+        self.addr = (host, port)
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.settimeout(0.5)
+
+    def send(self, payload: dict) -> None:
+        self.sock.sendto(json.dumps(payload).encode(), self.addr)
+
+    def recv(self, timeout: float = 0.5) -> dict | None:
+        self.sock.settimeout(timeout)
+        try:
+            data, _ = self.sock.recvfrom(512)
+        except TimeoutError:
+            return None
+        return json.loads(data.decode())
+
+    def close(self) -> None:
+        self.sock.close()
+
+
+def handshake(peer: UdpPeer) -> dict:
+    peer.send({"pv": 4, "type": "hello", "boot_id": BOOT_ID, "device": "loopback"})
+    st = peer.recv(timeout=2.0)
+    assert st is not None and st.get("pv") == 4, st
     return st
 
 
-async def stream(ws, duration, q_fn, p_fn, engaged, hz=20.0, seq0=0):
+def stream(peer: UdpPeer, duration, q_fn, engaged, hz=20.0, seq0=0):
     dt = 1.0 / hz
     t0 = time.monotonic()
     seq = seq0
     while time.monotonic() - t0 < duration:
         t = time.monotonic() - t0
-        await ws.send(json.dumps(sample(seq, q_fn(t), p_fn(t), engaged)))
+        peer.send(sample(seq, q_fn(t), engaged))
+        peer.recv(timeout=0.05)
         seq += 1
-        await asyncio.sleep(dt)
+        time.sleep(dt)
     return seq
 
 
-async def drain_until(ws, predicate, timeout=3.0):
-    deadline = time.monotonic() + timeout
-    last = None
-    while time.monotonic() < deadline:
-        try:
-            last = json.loads(await asyncio.wait_for(ws.recv(), timeout=0.3))
-        except TimeoutError:
-            continue
-        if predicate(last):
-            return last
-    raise AssertionError(f"timeout waiting for message; last={last}")
-
-
-async def test_reset_rebase(url: str) -> None:
-    async with websockets.connect(url) as ws:
-        await handshake(ws)
-        seq = await stream(ws, 0.4, lambda t: wxyz(0, 0, 0), lambda t: (0, 0, 0), True)
-        seq = await stream(ws, 0.8, lambda t: wxyz(0, 0, 0.3), lambda t: (0, 0, 0), True, seq0=seq)
-        await ws.send(json.dumps(sample(seq, wxyz(0, 0, 0.3), (0, 0, 0), False)))
-        await ws.send(json.dumps({"type": "reset", "boot_id": BOOT_ID, "op_id": 1}))
-        accepted = await drain_until(
-            ws, lambda m: m.get("type") == "reset_result" and m.get("status") == "accepted"
-        )
-        assert accepted["op_id"] == 1
-        done = await drain_until(
-            ws,
-            lambda m: m.get("type") == "reset_result"
-            and m.get("status") in {"completed", "failed"},
-            timeout=4.0,
-        )
-        assert done["status"] == "completed", done
+def test_reset_rebase(host: str, port: int) -> None:
+    peer = UdpPeer(host, port)
+    try:
+        handshake(peer)
+        seq = stream(peer, 0.4, lambda t: wxyz(0, 0, 0), True)
+        seq = stream(peer, 0.8, lambda t: wxyz(0, 0, 0.3), True, seq0=seq)
+        peer.send(sample(seq, wxyz(0, 0, 0.3), False, op=1))
+        deadline = time.monotonic() + 4.0
+        seen_accepted = False
+        done = None
+        while time.monotonic() < deadline:
+            msg = peer.recv(timeout=0.3)
+            if msg is None:
+                seq += 1
+                peer.send(sample(seq, wxyz(0, 0, 0.3), False, op=1))
+                continue
+            if msg.get("op_status") == "accepted":
+                seen_accepted = True
+            if msg.get("op_status") in {"completed", "failed"}:
+                done = msg
+                break
+        assert done is not None and done["op_status"] == "completed", done
+        assert seen_accepted or done["op_ack"] == 1
+    finally:
+        peer.close()
     print("OK reset_rebase")
 
 
-async def test_watchdog_freeze(url: str) -> None:
-    async with websockets.connect(url) as ws:
-        await handshake(ws)
-        seq = await stream(ws, 0.5, lambda t: wxyz(0, 0.2, 0), lambda t: (0, 0, 0), True)
-        await asyncio.sleep(0.5)  # > 300 ms stale
-        # Resume engaged — must be a fresh rising edge (no exception / still linked)
-        await stream(ws, 0.4, lambda t: wxyz(0, 0.5, 0), lambda t: (0, 0, 0), True, seq0=seq)
+def test_watchdog_freeze(host: str, port: int) -> None:
+    peer = UdpPeer(host, port)
+    try:
+        handshake(peer)
+        seq = stream(peer, 0.5, lambda t: wxyz(0, 0.2, 0), True)
+        time.sleep(0.8)
+        stream(peer, 0.4, lambda t: wxyz(0, 0.5, 0), True, seq0=seq)
+    finally:
+        peer.close()
     print("OK watchdog_freeze")
 
 
-async def test_reconnect_no_jump(url: str) -> None:
-    async with websockets.connect(url) as ws:
-        await handshake(ws)
-        await stream(ws, 0.6, lambda t: wxyz(0, 0, 0.25 * t), lambda t: (0, 0, 0), True)
-    await asyncio.sleep(0.3)
-    async with websockets.connect(url) as ws:
-        st = await handshake(ws)
+def test_resume_after_gap(host: str, port: int) -> None:
+    peer = UdpPeer(host, port)
+    try:
+        st = handshake(peer)
         assert st.get("mode") in {"idle", "engaged", "fault"}
-        await stream(ws, 0.4, lambda t: wxyz(0, 0, 0), lambda t: (0, 0, 0), True)
-    print("OK reconnect_no_jump")
+        stream(peer, 0.6, lambda t: wxyz(0, 0, 0.25 * t), True)
+        time.sleep(0.3)
+        stream(peer, 0.4, lambda t: wxyz(0, 0, 0), True, seq0=20)
+    finally:
+        peer.close()
+    print("OK resume_after_gap")
 
 
-async def run_all(url: str) -> None:
-    await test_reset_rebase(url)
-    await test_watchdog_freeze(url)
-    await test_reconnect_no_jump(url)
+def run_all(host: str, port: int) -> None:
+    test_reset_rebase(host, port)
+    test_watchdog_freeze(host, port)
+    test_resume_after_gap(host, port)
     print("loopback OK")
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--url", default="ws://127.0.0.1:8766/ws")
+    ap.add_argument("--host", default=DEFAULT_HOST)
+    ap.add_argument("--port", type=int, default=DEFAULT_PORT)
     ap.add_argument("--start-app", action="store_true")
     args = ap.parse_args()
 
@@ -174,14 +173,14 @@ def main() -> None:
                 with urllib.request.urlopen("http://127.0.0.1:8766/api/status", timeout=0.5) as r:
                     if r.status == 200:
                         body = json.loads(r.read().decode())
-                        assert body.get("protocol_version") == 2
+                        assert body.get("protocol_version") == 4
                         break
             except Exception:
                 time.sleep(0.2)
         else:
             raise SystemExit("app did not become ready on :8766")
     try:
-        asyncio.run(run_all(args.url))
+        run_all(args.host, args.port)
     finally:
         if app_proc is not None:
             app_proc.terminate()

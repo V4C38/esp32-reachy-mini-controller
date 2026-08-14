@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "esp32_motion_controller"
-version = "2.0.0"
+version = "3.1.6"
 description = "ESP32 Motion Controller — handheld IMU controller for Reachy Mini"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -19,7 +19,7 @@ dependencies = [
 keywords = ["reachy-mini-app"]
 
 [project.optional-dependencies]
-dev = ["pytest", "pytest-asyncio", "httpx", "websockets"]
+dev = ["pytest", "pytest-asyncio", "httpx"]
 
 [project.entry-points."reachy_mini_apps"]
 esp32_motion_controller = "esp32_motion_controller.main:Esp32MotionController"

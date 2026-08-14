@@ -21,5 +21,3 @@ void imu_get_raw_mapped(float accel[3], float gyro[3]);
 /* True if remapped accel is consistent with the intended hold
  * (screen toward user, USB+buttons down ⇒ gravity along +Y). */
 bool imu_gravity_sane(void);
-
-void imu_reset_displacement(void);

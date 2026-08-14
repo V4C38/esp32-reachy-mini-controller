@@ -110,6 +110,15 @@ menu "Board Support Package"
             default 100
             help
                 Height of LVGL buffer. The width of the buffer is the same as that of the LCD.
+
+        config BSP_DISPLAY_LVGL_QSPI_FULL_REFRESH
+            bool "LVGL full refresh on QSPI (full PSRAM draw buffer)"
+            default n
+            help
+                Redraw the whole screen each LVGL frame instead of dirty rectangles
+                only. Allocates one full-frame draw buffer in PSRAM; QSPI DMA chunks
+                stay capped. Reduces visible banding when filming the panel with a
+                phone camera.
     endmenu
 
     config BSP_I2S_NUM

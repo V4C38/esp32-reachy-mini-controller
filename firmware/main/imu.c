@@ -118,13 +118,6 @@ esp_err_t imu_init(i2c_master_bus_handle_t bus)
 bool imu_ready(void) { return s_hw_ok && s_state.ready; }
 bool imu_still(void) { return s_state.still; }
 
-void imu_reset_displacement(void)
-{
-    if (s_lock) xSemaphoreTake(s_lock, portMAX_DELAY);
-    imu_integrate_reset_motion(&s_state);
-    if (s_lock) xSemaphoreGive(s_lock);
-}
-
 void imu_get_state(imu_integrate_state_t *out)
 {
     if (!out) return;

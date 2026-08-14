@@ -50,17 +50,6 @@ void imu_integrate_init(imu_integrate_state_t *s)
     s->w_still = 0.08f;
     s->still_dwell = 0.10f;
     s->still_t = 0.f;
-    s->v_decay_tau = 0.50f;
-    s->a_dead = 0.03f;
-    s->a_dead_w_scale = 0.40f;
-    s->w_gate = 0.60f;   /* ~34 deg/s — above this, skip a_world integration */
-    s->p_max = 0.080f;   /* 80 mm of hand travel before clamp */
-}
-
-void imu_integrate_reset_motion(imu_integrate_state_t *s)
-{
-    s->v[0] = s->v[1] = s->v[2] = 0.f;
-    s->p[0] = s->p[1] = s->p[2] = 0.f;
 }
 
 /* Internal calib accumulators — single instance (host sim + firmware). */
@@ -141,7 +130,6 @@ void imu_integrate_step(imu_integrate_state_t *s,
     }
     s->still = hard_still && (s->still_t >= s->still_dwell);
 
-    /* kp_high only after sustained stillness — never during translation. */
     float kp = s->still ? s->kp_high : s->kp_low;
 
     float q0 = s->q[0], q1 = s->q[1], q2 = s->q[2], q3 = s->q[3];
@@ -170,60 +158,4 @@ void imu_integrate_step(imu_integrate_state_t *s,
     s->q[2] = q2 + dq2 * dt;
     s->q[3] = q3 + dq3 * dt;
     q_normalize(s->q);
-
-    /* Recompute a_lin with updated attitude */
-    float q_conj[4] = {s->q[0], -s->q[1], -s->q[2], -s->q[3]};
-    float g_body[3];
-    q_rotate(q_conj, g_world, g_body);
-    float a_lin[3] = {
-        accel[0] - g_body[0],
-        accel[1] - g_body[1],
-        accel[2] - g_body[2],
-    };
-
-    /* Deadband grows with rotation rate — attitude error leaks as false a_lin. */
-    float a_dead = s->a_dead + s->a_dead_w_scale * wn;
-    for (int i = 0; i < 3; i++) {
-        if (fabsf(a_lin[i]) < a_dead) a_lin[i] = 0.f;
-    }
-
-    float a_world[3];
-    q_rotate(s->q, a_lin, a_world);
-
-    /* Gate: while rotating hard, a_lin is dominated by attitude error. */
-    float gate = 1.f;
-    if (wn > s->w_gate) {
-        gate = 0.f;
-    } else if (s->w_gate > 1e-6f) {
-        /* Soft fade from w_gate/2 → w_gate */
-        float half = 0.5f * s->w_gate;
-        if (wn > half) {
-            gate = 1.f - (wn - half) / (s->w_gate - half);
-        }
-    }
-
-    if (hard_still) {
-        /* Genuine stop: hard ZUPT + soft decay of residual velocity. */
-        float decay = expf(-dt / (s->v_decay_tau > 1e-3f ? s->v_decay_tau : 0.5f));
-        for (int i = 0; i < 3; i++) s->v[i] *= decay;
-        if (s->still) {
-            s->v[0] = s->v[1] = s->v[2] = 0.f;
-        }
-    } else {
-        for (int i = 0; i < 3; i++) {
-            s->v[i] += gate * a_world[i] * dt;
-        }
-    }
-
-    for (int i = 0; i < 3; i++) {
-        s->p[i] += s->v[i] * dt;
-        /* Clamp with outward-velocity zeroing so the return stroke unwinds. */
-        if (s->p[i] > s->p_max) {
-            s->p[i] = s->p_max;
-            if (s->v[i] > 0.f) s->v[i] = 0.f;
-        } else if (s->p[i] < -s->p_max) {
-            s->p[i] = -s->p_max;
-            if (s->v[i] < 0.f) s->v[i] = 0.f;
-        }
-    }
 }

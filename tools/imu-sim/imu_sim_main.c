@@ -1,11 +1,11 @@
 /*
- * Host acceptance harness for imu_integrate.c.
+ * Host acceptance harness for imu_integrate.c (Mahony attitude only).
  *
  * Generates physically consistent IMU samples (attitude and accelerometer
  * computed at the same instant) and asserts:
- *   - per-direction translation: correct sign, recovered magnitude band
- *   - rotation-only: phantom translation stays below a useful-signal fraction
- *   - stationary: no creep
+ *   - calibration becomes ready
+ *   - stationary: attitude stays near identity, still flag latches
+ *   - rotation tracking: recovered angle stays in a useful band of truth
  */
 #include "imu_integrate.h"
 
@@ -70,12 +70,11 @@ static void q_integrate_gyro(float q[4], const float gyro[3], float dt)
     q_normalize(q);
 }
 
-/* Min-jerk acceleration for displacement d over duration T at time t. */
-static float minjerk_accel(float d, float T, float t)
+static float q_angle(const float q[4])
 {
-    if (t < 0.f || t > T) return 0.f;
-    float s = t / T;
-    return d / (T * T) * (60.f * s - 180.f * s * s + 120.f * s * s * s);
+    float w = fabsf(q[0]);
+    if (w > 1.f) w = 1.f;
+    return 2.f * acosf(w);
 }
 
 static void calib_and_settle(imu_integrate_state_t *s)
@@ -90,46 +89,14 @@ static void calib_and_settle(imu_integrate_state_t *s)
         fail("calib did not become ready");
         return;
     }
-    /* Settle attitude under gravity. */
     for (int i = 0; i < (int)(2.0f / DT); i++) {
         imu_integrate_step(s, gyro0, accel0, DT);
-    }
-    imu_integrate_reset_motion(s);
-}
-
-/* Feed a pure world-axis translation with upright attitude (gravity along +Z world). */
-static void run_translation(imu_integrate_state_t *s, int axis, float d, float T)
-{
-    float gyro0[3] = {0.f, 0.f, 0.f};
-    int n = (int)(T / DT);
-    for (int i = 0; i < n; i++) {
-        float a_lin = minjerk_accel(d, T, i * DT);
-        float accel[3] = {0.f, 0.f, G};
-        accel[axis] += a_lin;
-        /* Gyro includes residual bias so the estimator sees realistic noise. */
-        float gyro[3] = {
-            s->gyro_bias[0],
-            s->gyro_bias[1],
-            s->gyro_bias[2],
-        };
-        imu_integrate_step(s, gyro, accel, DT);
-        (void)gyro0;
-    }
-    /* Settle still. */
-    float accel0[3] = {0.f, 0.f, G};
-    float gyro_still[3] = {
-        s->gyro_bias[0],
-        s->gyro_bias[1],
-        s->gyro_bias[2],
-    };
-    for (int i = 0; i < (int)(1.0f / DT); i++) {
-        imu_integrate_step(s, gyro_still, accel0, DT);
     }
 }
 
 /*
  * Rotation-only about a body axis. Attitude and gravity-in-body are kept
- * consistent at every sample so the only residual a_lin is filter lag.
+ * consistent at every sample so Mahony sees a physically valid accel.
  */
 static void run_rotation(imu_integrate_state_t *s, int axis, float angle_rad, float T)
 {
@@ -139,7 +106,6 @@ static void run_rotation(imu_integrate_state_t *s, int axis, float angle_rad, fl
     for (int i = 0; i < n; i++) {
         float gyro[3] = {0.f, 0.f, 0.f};
         gyro[axis] = w;
-        /* Advance truth first, then sample accel at the new attitude. */
         q_integrate_gyro(q_truth, gyro, DT);
         float g_world[3] = {0.f, 0.f, G};
         float q_conj[4] = {q_truth[0], -q_truth[1], -q_truth[2], -q_truth[3]};
@@ -152,7 +118,6 @@ static void run_rotation(imu_integrate_state_t *s, int axis, float angle_rad, fl
         };
         imu_integrate_step(s, gyro_meas, accel, DT);
     }
-    /* Hold final attitude still. */
     float g_world[3] = {0.f, 0.f, G};
     float q_conj[4] = {q_truth[0], -q_truth[1], -q_truth[2], -q_truth[3]};
     float accel[3];
@@ -172,104 +137,46 @@ static int self_test(void)
     g_fails = 0;
     imu_integrate_state_t s;
 
-    /* --- Stationary drift --- */
+    /* --- Stationary attitude --- */
     calib_and_settle(&s);
     float gyro0[3] = {s.gyro_bias[0], s.gyro_bias[1], s.gyro_bias[2]};
     float accel0[3] = {0.f, 0.f, G};
     for (int i = 0; i < (int)(30.0f / DT); i++) {
         imu_integrate_step(&s, gyro0, accel0, DT);
     }
-    float drift = sqrtf(s.p[0]*s.p[0] + s.p[1]*s.p[1] + s.p[2]*s.p[2]);
-    printf("stationary drift = %.5f m\n", drift);
-    if (drift > 0.002f) fail("stationary drift > 2 mm");
+    float tilt = q_angle(s.q);
+    printf("stationary tilt = %.3f deg  still=%d\n", tilt * 180.f / (float)M_PI, s.still ? 1 : 0);
+    if (tilt > 2.f * (float)M_PI / 180.f) fail("stationary tilt > 2 deg");
+    if (!s.still) fail("stationary still flag not set");
 
-    /* --- Per-direction translation --- */
-    /* Useful-signal targets: recover at least 40% of truth, correct sign,
-     * and stay below 150% (no runaway). */
-    const float distances[] = {0.030f, 0.050f, 0.080f};
-    const float durations[] = {0.40f, 0.60f, 0.80f};
-    const char *axis_name[] = {"+X", "+Y", "+Z"};
-    float best_mag = 0.f;
-    float worst_frac = 1.f;
-
-    for (int axis = 0; axis < 3; axis++) {
-        for (int sign = -1; sign <= 1; sign += 2) {
-            for (size_t k = 0; k < sizeof(distances) / sizeof(distances[0]); k++) {
-                float d = sign * distances[k];
-                float T = durations[k];
-                calib_and_settle(&s);
-                run_translation(&s, axis, d, T);
-                float p_axis = s.p[axis];
-                float mag = fabsf(p_axis);
-                float truth = fabsf(d);
-                float frac = mag / truth;
-                printf("trans %s%s d=%+.3f T=%.2f → p=[%+.4f %+.4f %+.4f] "
-                       "axis=%+.4f (%.0f%%)\n",
-                       sign > 0 ? "+" : "-", axis_name[axis] + 1,
-                       d, T, s.p[0], s.p[1], s.p[2], p_axis, 100.f * frac);
-
-                if ((p_axis > 0.f) != (d > 0.f) && mag > 0.002f) {
-                    char buf[128];
-                    snprintf(buf, sizeof(buf),
-                             "wrong sign on axis %d (got %+.4f, want sign of %+.3f)",
-                             axis, p_axis, d);
-                    fail(buf);
-                }
-                if (frac < 0.40f) {
-                    char buf[128];
-                    snprintf(buf, sizeof(buf),
-                             "recovered only %.0f%% of %.0f mm on axis %d",
-                             100.f * frac, 1000.f * truth, axis);
-                    fail(buf);
-                }
-                if (frac > 1.50f) {
-                    char buf[128];
-                    snprintf(buf, sizeof(buf),
-                             "overshot to %.0f%% of %.0f mm on axis %d",
-                             100.f * frac, 1000.f * truth, axis);
-                    fail(buf);
-                }
-                if (mag > best_mag) best_mag = mag;
-                if (frac < worst_frac) worst_frac = frac;
-            }
-        }
-    }
-
-    /* --- Rotation-only phantom --- */
-    /* Phantom must stay well below the useful translation signal. */
+    /* --- Rotation tracking --- */
     const float angles_deg[] = {20.f, 30.f, 45.f};
-    float worst_phantom = 0.f;
+    const char *axis_name[] = {"X", "Y", "Z"};
     for (int axis = 0; axis < 3; axis++) {
         for (size_t k = 0; k < sizeof(angles_deg) / sizeof(angles_deg[0]); k++) {
             float ang = angles_deg[k] * (float)M_PI / 180.f;
             float T = 0.50f;
             calib_and_settle(&s);
             run_rotation(&s, axis, ang, T);
-            float mag = sqrtf(s.p[0]*s.p[0] + s.p[1]*s.p[1] + s.p[2]*s.p[2]);
-            printf("rot-only axis=%d %.0fdeg → phantom=%.4f m  p=[%+.4f %+.4f %+.4f]\n",
-                   axis, angles_deg[k], mag, s.p[0], s.p[1], s.p[2]);
-            if (mag > worst_phantom) worst_phantom = mag;
-            /* Absolute cap: 8 mm; also must be < 25% of best recovered translation. */
-            if (mag > 0.008f) {
+            float recovered = q_angle(s.q);
+            float frac = recovered / ang;
+            printf("rot axis=%s %.0fdeg → recovered=%.1fdeg (%.0f%%)\n",
+                   axis_name[axis], angles_deg[k], recovered * 180.f / (float)M_PI, 100.f * frac);
+            if (frac < 0.70f) {
                 char buf[128];
                 snprintf(buf, sizeof(buf),
-                         "phantom %.1f mm > 8 mm for %.0fdeg about axis %d",
-                         1000.f * mag, angles_deg[k], axis);
+                         "recovered only %.0f%% of %.0fdeg about axis %s",
+                         100.f * frac, angles_deg[k], axis_name[axis]);
+                fail(buf);
+            }
+            if (frac > 1.30f) {
+                char buf[128];
+                snprintf(buf, sizeof(buf),
+                         "overshot to %.0f%% of %.0fdeg about axis %s",
+                         100.f * frac, angles_deg[k], axis_name[axis]);
                 fail(buf);
             }
         }
-    }
-
-    printf("\n--- summary ---\n");
-    printf("best recovered translation = %.1f mm\n", 1000.f * best_mag);
-    printf("worst recovery fraction    = %.0f%%\n", 100.f * worst_frac);
-    printf("worst rotation phantom     = %.1f mm\n", 1000.f * worst_phantom);
-    if (best_mag > 1e-6f && worst_phantom > 0.25f * best_mag) {
-        char buf[128];
-        snprintf(buf, sizeof(buf),
-                 "phantom (%.1f mm) exceeds 25%% of best translation (%.1f mm)",
-                 1000.f * worst_phantom, 1000.f * best_mag);
-        fail(buf);
     }
 
     if (g_fails) {

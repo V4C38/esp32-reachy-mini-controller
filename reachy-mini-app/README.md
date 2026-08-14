@@ -10,15 +10,15 @@ tags:
   - reachy_mini
   - reachy_mini_python_app
   - esp32
-  - websocket
+  - udp
   - imu
 ---
 
 # ESP32 Motion Controller
 
-WebSocket bridge (protocol v2) for an ESP32 handheld IMU controller that drives Reachy Mini's head with clutch-style relative motion, IK-safe clamping, antenna idle animation, and body follow only when head exceeds the neck yaw threshold.
+Reachy Mini app that receives protocol v4 UDP samples from the handheld ESP32. Engage snapshots IMU zero; roll/pitch/yaw stay clutch-relative (rotation only). The app owns IK-safe clamping, hard yaw stops, antenna idle, and body follow.
 
-See the [repository README](https://github.com/V4C38/esp32-reachy-mini-controller) and [`PROTOCOL.md`](../PROTOCOL.md). Firmware and app must both speak protocol v2.
+See the [repository README](https://github.com/V4C38/esp32-reachy-mini-controller) and [`PROTOCOL.md`](../PROTOCOL.md). Firmware and app must both speak v4.
 
 ## Local install
 
@@ -27,8 +27,7 @@ pip install -e .
 python -m esp32_motion_controller.main
 ```
 
-WebSocket: `ws://<host>:8766/ws`
-
+UDP: `<host>:8766`
 
 Live Space: https://huggingface.co/spaces/V4C38/esp32_motion_controller
 
@@ -50,8 +49,4 @@ hf upload YOUR_USER/esp32_motion_controller . --repo-type space \
   --exclude ".DS_Store"
 ```
 
-Ensure README frontmatter includes those tags before upload.
-
-The excludes matter: `packages.find` would otherwise pick up a stray `build/lib/`
-tree as a second copy of the package, and `.pyc` files built by a different
-Python end up installed into the daemon's 3.12 venv.
+Keep those tags in the README frontmatter. The excludes matter: `packages.find` would otherwise pick up a stray `build/lib/` as a second copy of the package, and `.pyc` files from another Python end up in the daemon's 3.12 venv.

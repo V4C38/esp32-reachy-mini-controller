@@ -12,12 +12,12 @@
 </head>
 <body>
   <h1>🕹️ ESP32 Motion Controller</h1>
-  <p>ESP32 handheld IMU controller bridge for Reachy Mini (protocol v2).</p>
-  <p>WebSocket: <code id="ws">ws://…:8766/ws</code></p>
+  <p>ESP32 handheld IMU controller bridge for Reachy Mini (protocol v4).</p>
+  <p>UDP: <code id="udp">…:8766</code></p>
   <p><a href="/api/info">/api/info</a> · <a href="/api/status">/api/status</a></p>
   <script>
     fetch('/api/info').then(r => r.json()).then(j => {
-      if (j.ws_url) document.getElementById('ws').textContent = j.ws_url;
+      if (j.udp) document.getElementById('udp').textContent = j.udp;
     }).catch(() => {});
   </script>
 </body>

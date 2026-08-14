@@ -1,11 +1,12 @@
 idf_component_register(
     SRCS
         "main.c"
+        "diag.c"
         "imu.c"
         "imu_integrate.c"
         "net_wifi.c"
         "net_discovery.c"
-        "net_ws.c"
+        "net_link.c"
         "pmu.c"
         "ui.c"
         "ui_face.c"

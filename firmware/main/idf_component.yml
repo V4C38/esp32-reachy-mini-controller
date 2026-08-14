@@ -5,12 +5,10 @@ dependencies:
   waveshare/esp32_s3_touch_amoled_1_8:
     version: "^2.0.3"
     public: true
-    # Local fork: init-time landscape SW rotate + non-100% boot brightness.
+    # Local fork: init-time landscape SW rotate.
     override_path: "../components/waveshare__esp32_s3_touch_amoled_1_8"
   waveshare/qmi8658:
     version: "^2.0.0"
     public: true
-  espressif/esp_websocket_client:
-    version: "^1.2.0"
   espressif/mdns:
     version: "^1.2.0"

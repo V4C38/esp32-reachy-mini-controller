@@ -32,7 +32,7 @@ static const char *TAG = "ESP32-S3-Touch-AMOLED-1.8";
  * lost, that busy-wait freezes the UI forever (black screen until reset).
  * We wait on a done flag with a timeout; after several consecutive timeouts
  * we reboot rather than limp with a dead display. */
-#define BSP_FLUSH_WAIT_US 40000
+#define BSP_FLUSH_WAIT_US 80000
 #define BSP_FLUSH_FAIL_RESTART 5
 
 static volatile bool s_flush_done;
@@ -395,8 +395,8 @@ esp_codec_dev_handle_t bsp_audio_codec_microphone_init(void)
 
 esp_err_t bsp_display_brightness_init(void)
 {
-    /* Idle/disconnected level — full brightness only when the app engages. */
-    bsp_display_brightness_set(30);
+    /* Panel init cmds already set stock brightness (0x51 = 0xFF). Do not
+     * override it — link state is the DISCONNECTED label, not PWM dimming. */
     return ESP_OK;
 }
 
@@ -508,11 +508,14 @@ esp_err_t bsp_display_new(const bsp_display_config_t *config, esp_lcd_panel_hand
                                                                  16 * 1024);
     ESP_ERROR_CHECK(spi_bus_initialize(BSP_LCD_SPI_NUM, &buscfg, SPI_DMA_CH_AUTO));
 
-    /* Keep the stock QSPI IO config. psram_dma_direct looks attractive (no
-     * bounce buffer) but on this board — app code/rodata in PSRAM — it DMA-
-     * underflows the SPI engine. Bounce buffers are fine when chunked (above)
-     * and enough internal DMA heap is reserved. */
-    const esp_lcd_panel_io_spi_config_t io_config = CO5300_PANEL_IO_QSPI_CONFIG(BSP_LCD_CS, NULL, NULL);
+    /* Keep the stock QSPI IO config except queue depth. The macro's depth of
+     * 10 would pin ~160 KB of 16 KB DMA bounce buffers during a full-frame
+     * flush; after WiFi that exhausts internal DMA heap. Depth 2 keeps one
+     * chunk in flight without starving WiFi. psram_dma_direct looks attractive
+     * (no bounce buffer) but on this board — app code/rodata in PSRAM — it
+     * DMA-underflows the SPI engine. */
+    esp_lcd_panel_io_spi_config_t io_config = CO5300_PANEL_IO_QSPI_CONFIG(BSP_LCD_CS, NULL, NULL);
+    io_config.trans_queue_depth = 2;
 
     co5300_vendor_config_t vendor_config = {
         .init_cmds = lcd_init_cmds,
@@ -621,7 +624,9 @@ static lv_display_t *bsp_display_lcd_init()
     BSP_ERROR_CHECK_RETURN_NULL(bsp_display_new(&disp_config, &panel_handle, &io_handle));
 
     int buffer_size = 0;
-#if CONFIG_BSP_DISPLAY_LVGL_AVOID_TEAR
+#if CONFIG_BSP_DISPLAY_LVGL_AVOID_TEAR || CONFIG_BSP_DISPLAY_LVGL_QSPI_FULL_REFRESH
+    /* esp_lvgl_port requires a full-frame draw buffer for full_refresh.
+     * It lives in PSRAM; QSPI DMA bounce chunks stay 16 KB. */
     buffer_size = BSP_LCD_H_RES * BSP_LCD_V_RES;
 #else
     buffer_size = BSP_LCD_H_RES * LVGL_BUFFER_HEIGHT;
@@ -654,6 +659,8 @@ static lv_display_t *bsp_display_lcd_init()
             .full_refresh = 1,
 #elif CONFIG_BSP_DISPLAY_LVGL_DIRECT_MODE
             .direct_mode = 1,
+#elif CONFIG_BSP_DISPLAY_LVGL_QSPI_FULL_REFRESH
+            .full_refresh = 1,
 #endif
 #if LVGL_VERSION_MAJOR >= 9
             .swap_bytes = true,
@@ -739,7 +746,7 @@ lv_display_t *bsp_display_start(void)
             .buff_dma = false,
             .buff_spiram = true,
         }};
-    /* Pin LVGL to core 1. WiFi / lwIP / websocket live on core 0 — if the
+    /* Pin LVGL to core 1. WiFi / lwIP / UDP live on core 0 — if the
      * display task ever busy-waits, core 0 must still service the radio or
      * the controller flaps connect/disconnect. */
     cfg.lvgl_port_cfg.task_affinity = 1;

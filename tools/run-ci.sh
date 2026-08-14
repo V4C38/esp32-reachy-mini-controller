@@ -15,9 +15,9 @@ echo "==> Host IMU integrator sim"
 bash tools/imu-sim/build.sh
 tools/imu-sim/out/imu_sim --self-test
 
-echo "==> Protocol v2 loopback"
+echo "==> Protocol v4 loopback"
 pkill -f "esp32_motion_controller.main" 2>/dev/null || true
-# Prefer the app venv interpreter so websockets/scipy resolve.
+# Prefer the app venv interpreter so scipy/fastapi resolve.
 if [[ -x reachy-mini-app/.venv/bin/python ]]; then
   reachy-mini-app/.venv/bin/python tools/loopback_test.py --start-app
 else

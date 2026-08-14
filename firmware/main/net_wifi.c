@@ -2,9 +2,11 @@
 
 #include <string.h>
 #include "config.h"
+#include "diag.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
@@ -15,21 +17,51 @@ static const char *TAG = "net_wifi";
 static EventGroupHandle_t s_wifi_event;
 #define WIFI_CONNECTED_BIT BIT0
 static bool s_connected;
+static int64_t s_up_since_us;
+static uint32_t s_disconnects;
+static int s_last_reason;
+static int s_last_rssi;
+
+static int wifi_rssi(void)
+{
+    int rssi = 0;
+    if (esp_wifi_sta_get_rssi(&rssi) != ESP_OK) return 0;
+    return rssi;
+}
 
 static void event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        wifi_event_sta_disconnected_t *e = (wifi_event_sta_disconnected_t *)data;
+        int64_t up_ms = 0;
+        if (s_up_since_us > 0) {
+            up_ms = (esp_timer_get_time() - s_up_since_us) / 1000;
+        }
         s_connected = false;
+        s_up_since_us = 0;
+        s_disconnects++;
+        s_last_reason = e ? (int)e->reason : -1;
+        s_last_rssi = e ? (int)e->rssi : wifi_rssi();
         xEventGroupClearBits(s_wifi_event, WIFI_CONNECTED_BIT);
-        ESP_LOGW(TAG, "disconnected; reconnecting");
+        ESP_LOGW(TAG,
+                 "disconnected reason=%d rssi=%d up_ms=%lld count=%lu; reconnecting",
+                 s_last_reason,
+                 s_last_rssi,
+                 (long long)up_ms,
+                 (unsigned long)s_disconnects);
+        diag_log_resources("wifi_down", NULL, NULL);
         esp_wifi_connect();
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         s_connected = true;
+        s_up_since_us = esp_timer_get_time();
         xEventGroupSetBits(s_wifi_event, WIFI_CONNECTED_BIT);
         ip_event_got_ip_t *e = (ip_event_got_ip_t *)data;
-        ESP_LOGI(TAG, "got ip: " IPSTR, IP2STR(&e->ip_info.ip));
+        ESP_LOGI(TAG, "got ip: " IPSTR " rssi=%d disconnects=%lu",
+                 IP2STR(&e->ip_info.ip), wifi_rssi(),
+                 (unsigned long)s_disconnects);
+        diag_log_resources("wifi_up", NULL, NULL);
     }
 }
 
@@ -67,7 +99,7 @@ esp_err_t net_wifi_start(void)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
-    /* Realtime 20 Hz pose stream cannot tolerate DTIM sleep latency.
+    /* Realtime pose stream cannot tolerate DTIM sleep latency.
      * Raises idle current — only matters for the optional LiPo. */
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
     ESP_LOGI(TAG, "connecting to SSID '%s'", ssid);
@@ -82,3 +114,15 @@ esp_err_t net_wifi_start(void)
 }
 
 bool net_wifi_connected(void) { return s_connected; }
+
+net_wifi_info_t net_wifi_info(void)
+{
+    net_wifi_info_t info = {
+        .connected = s_connected,
+        .rssi = wifi_rssi(),
+        .disconnects = s_disconnects,
+        .last_reason = s_last_reason,
+        .last_rssi = s_last_rssi,
+    };
+    return info;
+}

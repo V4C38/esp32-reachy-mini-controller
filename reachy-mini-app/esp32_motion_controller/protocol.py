@@ -1,7 +1,8 @@
 """
-Protocol v2 parsing — dependency-light, no SDK imports.
+Protocol v4 parsing — dependency-light, no SDK imports.
 
-Rejects oversize frames, wrong types, non-finite numbers, and unsupported versions.
+UDP datagrams. Rejects oversize frames, wrong types, non-finite numbers,
+and unsupported versions.
 """
 
 from __future__ import annotations
@@ -11,10 +12,12 @@ import math
 from dataclasses import dataclass
 from typing import Any
 
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 4
 MAX_FRAME_BYTES = 512
 GAIN_MIN = 0.1
-GAIN_MAX = 3.0
+GAIN_MAX = 2.0
+LINK_STALE_SEC = 1.0
+HELLO_PERIOD_SEC = 2.0
 
 
 class ProtocolError(ValueError):
@@ -24,10 +27,37 @@ class ProtocolError(ValueError):
 
 
 @dataclass(frozen=True, slots=True)
+class LinkDiag:
+    rst: int = 0
+    wifi_n: int = 0
+    wifi_r: int = 0
+    rssi: int = 0
+    wifi_up: int = 0
+    down_ms: int = 0
+    send_ok: int = 0
+    send_fail: int = 0
+    send_ms: int = 0
+
+    def as_dict(self) -> dict[str, int]:
+        return {
+            "rst": self.rst,
+            "wifi_n": self.wifi_n,
+            "wifi_r": self.wifi_r,
+            "rssi": self.rssi,
+            "wifi_up": self.wifi_up,
+            "down_ms": self.down_ms,
+            "send_ok": self.send_ok,
+            "send_fail": self.send_fail,
+            "send_ms": self.send_ms,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class Hello:
     protocol_version: int
     boot_id: str
     device: str
+    diag: LinkDiag | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,10 +65,10 @@ class Sample:
     boot_id: str
     seq: int
     q: tuple[float, float, float, float]
-    p: tuple[float, float, float]
     engaged: bool
     gain: float
     ready: bool
+    op: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,7 +129,7 @@ def _require_vec(msg: dict[str, Any], key: str, n: int, request_type: str) -> tu
     return tuple(out)
 
 
-def parse_frame(raw: str | bytes) -> Hello | Sample | Reset:
+def parse_frame(raw: str | bytes) -> Hello | Sample:
     if isinstance(raw, bytes):
         if len(raw) > MAX_FRAME_BYTES:
             raise ProtocolError("frame exceeds size limit", request_type="parse")
@@ -118,38 +148,56 @@ def parse_frame(raw: str | bytes) -> Hello | Sample | Reset:
         raise ProtocolError(f"invalid JSON: {exc}", request_type="parse") from exc
 
     msg = _require_dict(msg, "parse")
-    msg_type = msg.get("type")
-    if not isinstance(msg_type, str):
-        raise ProtocolError("missing type", request_type="parse")
+    version = msg.get("pv")
+    if not isinstance(version, int) or isinstance(version, bool):
+        raise ProtocolError("missing pv", request_type="parse")
+    if version != PROTOCOL_VERSION:
+        raise ProtocolError(
+            f"unsupported protocol_version: {version}",
+            request_type="hello" if msg.get("type") == "hello" else "parse",
+        )
 
-    if msg_type == "hello":
+    if msg.get("type") == "hello":
         return parse_hello(msg)
-    if msg_type == "sample":
-        return parse_sample(msg)
-    if msg_type == "reset":
-        return parse_reset(msg)
-    raise ProtocolError(f"unknown message type: {msg_type}", request_type=msg_type)
+    return parse_sample(msg)
+
+
+def _optional_int(msg: dict[str, Any], key: str) -> int:
+    val = msg.get(key)
+    if isinstance(val, bool) or not isinstance(val, int):
+        return 0
+    return int(val)
+
+
+def parse_link_diag(raw: Any) -> LinkDiag | None:
+    if not isinstance(raw, dict):
+        return None
+    return LinkDiag(
+        rst=_optional_int(raw, "rst"),
+        wifi_n=_optional_int(raw, "wifi_n"),
+        wifi_r=_optional_int(raw, "wifi_r"),
+        rssi=_optional_int(raw, "rssi"),
+        wifi_up=_optional_int(raw, "wifi_up"),
+        down_ms=_optional_int(raw, "down_ms"),
+        send_ok=_optional_int(raw, "send_ok"),
+        send_fail=_optional_int(raw, "send_fail"),
+        send_ms=_optional_int(raw, "send_ms"),
+    )
 
 
 def parse_hello(msg: dict[str, Any]) -> Hello:
     request_type = "hello"
-    version = _require_int(msg, "protocol_version", request_type)
-    if version != PROTOCOL_VERSION:
-        raise ProtocolError(
-            f"unsupported protocol_version: {version}",
-            request_type=request_type,
-        )
     return Hello(
-        protocol_version=version,
+        protocol_version=PROTOCOL_VERSION,
         boot_id=_require_str(msg, "boot_id", request_type),
         device=_require_str(msg, "device", request_type) if "device" in msg else "esp32",
+        diag=parse_link_diag(msg.get("diag")),
     )
 
 
 def parse_sample(msg: dict[str, Any]) -> Sample:
     request_type = "sample"
     q = _require_vec(msg, "q", 4, request_type)
-    p = _require_vec(msg, "p", 3, request_type)
     gain = _require_finite_float(msg, "gain", request_type)
     if gain < GAIN_MIN or gain > GAIN_MAX:
         raise ProtocolError(
@@ -159,71 +207,39 @@ def parse_sample(msg: dict[str, Any]) -> Sample:
     seq = _require_int(msg, "seq", request_type)
     if seq < 0:
         raise ProtocolError("seq must be non-negative", request_type=request_type)
+    op = None
+    if "op" in msg:
+        op_val = _require_int(msg, "op", request_type)
+        if op_val < 0:
+            raise ProtocolError("op must be non-negative", request_type=request_type)
+        if op_val > 0:
+            op = op_val
     return Sample(
         boot_id=_require_str(msg, "boot_id", request_type),
         seq=seq,
         q=(q[0], q[1], q[2], q[3]),
-        p=(p[0], p[1], p[2]),
         engaged=_require_bool(msg, "engaged", request_type),
         gain=gain,
         ready=_require_bool(msg, "ready", request_type),
+        op=op,
     )
 
 
-def parse_reset(msg: dict[str, Any]) -> Reset:
-    request_type = "reset"
-    op_id = _require_int(msg, "op_id", request_type)
-    if op_id < 0:
-        raise ProtocolError("op_id must be non-negative", request_type=request_type)
-    return Reset(
-        boot_id=_require_str(msg, "boot_id", request_type),
-        op_id=op_id,
-    )
-
-
-def encode_hello_response(session_id: int) -> dict[str, Any]:
-    return {
-        "type": "hello",
-        "protocol_version": PROTOCOL_VERSION,
-        "session_id": int(session_id),
-    }
-
-
-def encode_host_state(
+def encode_state_reply(
     *,
     robot: bool,
     mode: str,
     error: str | None = None,
+    op_ack: int | None = None,
+    op_status: str | None = None,
 ) -> dict[str, Any]:
-    return {
-        "type": "host_state",
+    out: dict[str, Any] = {
+        "pv": PROTOCOL_VERSION,
         "robot": bool(robot),
         "mode": mode,
         "error": error,
     }
-
-
-def encode_reset_result(
-    *,
-    boot_id: str,
-    op_id: int,
-    status: str,
-    message: str | None = None,
-) -> dict[str, Any]:
-    out: dict[str, Any] = {
-        "type": "reset_result",
-        "boot_id": boot_id,
-        "op_id": int(op_id),
-        "status": status,
-    }
-    if message is not None:
-        out["message"] = message
+    if op_ack is not None:
+        out["op_ack"] = int(op_ack)
+        out["op_status"] = op_status
     return out
-
-
-def encode_error(request_type: str, message: str) -> dict[str, Any]:
-    return {
-        "type": "error",
-        "request_type": request_type,
-        "message": message,
-    }

@@ -1,4 +1,4 @@
-"""Protocol v2 parsing and encoding tests."""
+"""Protocol v4 parsing and encoding tests."""
 
 from __future__ import annotations
 
@@ -10,10 +10,7 @@ from esp32_motion_controller.protocol import (
     MAX_FRAME_BYTES,
     PROTOCOL_VERSION,
     ProtocolError,
-    encode_error,
-    encode_hello_response,
-    encode_host_state,
-    encode_reset_result,
+    encode_state_reply,
     parse_frame,
 )
 
@@ -22,8 +19,8 @@ def test_parse_hello_ok():
     msg = parse_frame(
         json.dumps(
             {
+                "pv": 4,
                 "type": "hello",
-                "protocol_version": 2,
                 "boot_id": "abc",
                 "device": "esp32-reachy-ctl",
             }
@@ -31,30 +28,81 @@ def test_parse_hello_ok():
     )
     assert msg.protocol_version == PROTOCOL_VERSION
     assert msg.boot_id == "abc"
+    assert msg.diag is None
 
 
-def test_parse_hello_rejects_v1():
+def test_parse_hello_diag():
+    msg = parse_frame(
+        json.dumps(
+            {
+                "pv": 4,
+                "type": "hello",
+                "boot_id": "abc",
+                "device": "esp32-reachy-ctl",
+                "diag": {
+                    "rst": 1,
+                    "wifi_n": 2,
+                    "wifi_r": 201,
+                    "rssi": -61,
+                    "wifi_up": 1,
+                    "down_ms": 180,
+                    "send_ok": 40,
+                    "send_fail": 1,
+                    "send_ms": 4,
+                },
+            }
+        )
+    )
+    assert msg.diag is not None
+    assert msg.diag.wifi_r == 201
+    assert msg.diag.down_ms == 180
+
+
+def test_parse_hello_rejects_v3():
     with pytest.raises(ProtocolError, match="unsupported"):
-        parse_frame(json.dumps({"type": "hello", "protocol_version": 1, "boot_id": "x"}))
+        parse_frame(json.dumps({"pv": 3, "type": "hello", "boot_id": "x"}))
+
+
+def test_parse_hello_rejects_v2():
+    with pytest.raises(ProtocolError, match="unsupported"):
+        parse_frame(json.dumps({"pv": 2, "type": "hello", "boot_id": "x"}))
 
 
 def test_parse_sample_ok():
     sample = parse_frame(
         json.dumps(
             {
-                "type": "sample",
+                "pv": 4,
                 "boot_id": "abc",
                 "seq": 3,
                 "q": [1, 0, 0, 0],
-                "p": [0, 0, 0],
                 "engaged": True,
                 "gain": 1.0,
                 "ready": True,
+                "op": 3,
             }
         )
     )
     assert sample.seq == 3
     assert sample.engaged is True
+    assert sample.op == 3
+
+
+def test_parse_sample_omits_op():
+    sample = parse_frame(
+        json.dumps(
+            {
+                "pv": 4,
+                "boot_id": "abc",
+                "seq": 1,
+                "q": [1, 0, 0, 0],
+                "engaged": False,
+                "gain": 1.0,
+                "ready": True,
+            }
+        )
+    )
+    assert sample.op is None
 
 
 def test_parse_sample_rejects_nan():
@@ -62,11 +110,10 @@ def test_parse_sample_rejects_nan():
         parse_frame(
             json.dumps(
                 {
-                    "type": "sample",
+                    "pv": 4,
                     "boot_id": "abc",
                     "seq": 1,
                     "q": [1, 0, 0, float("nan")],
-                    "p": [0, 0, 0],
                     "engaged": False,
                     "gain": 1.0,
                     "ready": True,
@@ -80,17 +127,47 @@ def test_parse_sample_rejects_gain_range():
         parse_frame(
             json.dumps(
                 {
-                    "type": "sample",
+                    "pv": 4,
                     "boot_id": "abc",
                     "seq": 1,
                     "q": [1, 0, 0, 0],
-                    "p": [0, 0, 0],
                     "engaged": False,
                     "gain": 9.0,
                     "ready": True,
                 }
             )
         )
+    with pytest.raises(ProtocolError, match="gain"):
+        parse_frame(
+            json.dumps(
+                {
+                    "pv": 4,
+                    "boot_id": "abc",
+                    "seq": 1,
+                    "q": [1, 0, 0, 0],
+                    "engaged": False,
+                    "gain": 2.1,
+                    "ready": True,
+                }
+            )
+        )
+
+
+def test_parse_sample_accepts_gain_max():
+    sample = parse_frame(
+        json.dumps(
+            {
+                "pv": 4,
+                "boot_id": "abc",
+                "seq": 1,
+                "q": [1, 0, 0, 0],
+                "engaged": False,
+                "gain": 2.0,
+                "ready": True,
+            }
+        )
+    )
+    assert sample.gain == 2.0
 
 
 def test_oversize_frame_rejected():
@@ -99,10 +176,13 @@ def test_oversize_frame_rejected():
         parse_frame(raw)
 
 
-def test_reset_and_encoders():
-    reset = parse_frame(json.dumps({"type": "reset", "boot_id": "b", "op_id": 7}))
-    assert reset.op_id == 7
-    assert encode_hello_response(3)["session_id"] == 3
-    assert encode_host_state(robot=True, mode="idle")["mode"] == "idle"
-    assert encode_reset_result(boot_id="b", op_id=7, status="completed")["status"] == "completed"
-    assert encode_error("reset", "nope")["message"] == "nope"
+def test_state_reply_encoder():
+    plain = encode_state_reply(robot=True, mode="idle")
+    assert plain["pv"] == PROTOCOL_VERSION
+    assert plain["mode"] == "idle"
+    assert "op_ack" not in plain
+    with_op = encode_state_reply(
+        robot=True, mode="resetting", op_ack=7, op_status="accepted"
+    )
+    assert with_op["op_ack"] == 7
+    assert with_op["op_status"] == "accepted"

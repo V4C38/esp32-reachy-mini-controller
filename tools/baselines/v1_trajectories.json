@@ -354,7 +354,7 @@
     ],
     "gain": {
       "desired": {
-        "pitch": 0.20000000000000018,
+        "pitch": 0.125,
         "roll": 0.0,
         "x": 0.0,
         "y": 0.0,
@@ -380,136 +380,13 @@
         "z": 0.0
       },
       "engaged": false
-    },
-    "translation": [
-      {
-        "command": {
-          "pitch": 0.0,
-          "roll": 0.0,
-          "x": 0.0,
-          "y": 0.0,
-          "yaw": 0.0,
-          "z": 0.0
-        },
-        "desired": {
-          "pitch": 0.0,
-          "roll": 0.0,
-          "x": 0.0,
-          "y": 0.0,
-          "yaw": 0.0,
-          "z": 0.0
-        },
-        "p": [
-          0,
-          0,
-          0
-        ],
-        "t": 0.0
-      },
-      {
-        "command": {
-          "pitch": 0.0,
-          "roll": 0.0,
-          "x": 0.0,
-          "y": 0.0,
-          "yaw": 0.0,
-          "z": 0.0025000000000000005
-        },
-        "desired": {
-          "pitch": 0.0,
-          "roll": 0.0,
-          "x": 0.0,
-          "y": 0.0,
-          "yaw": 0.0,
-          "z": 0.006
-        },
-        "p": [
-          0,
-          0.02,
-          0
-        ],
-        "t": 0.05
-      },
-      {
-        "command": {
-          "pitch": 0.0,
-          "roll": 0.0,
-          "x": 0.0,
-          "y": 0.0025000000000000005,
-          "yaw": 0.0,
-          "z": 0.005000000000000001
-        },
-        "desired": {
-          "pitch": 0.0,
-          "roll": 0.0,
-          "x": 0.0,
-          "y": 0.006,
-          "yaw": 0.0,
-          "z": 0.006
-        },
-        "p": [
-          0.02,
-          0.02,
-          0
-        ],
-        "t": 0.1
-      },
-      {
-        "command": {
-          "pitch": 0.0,
-          "roll": 0.0,
-          "x": 0.0025000000000000005,
-          "y": 0.005000000000000001,
-          "yaw": 0.0,
-          "z": 0.006
-        },
-        "desired": {
-          "pitch": 0.0,
-          "roll": 0.0,
-          "x": 0.009,
-          "y": 0.006,
-          "yaw": 0.0,
-          "z": 0.006
-        },
-        "p": [
-          0.02,
-          0.02,
-          0.03
-        ],
-        "t": 0.15
-      },
-      {
-        "command": {
-          "pitch": 0.0,
-          "roll": 0.0,
-          "x": 0.005000000000000001,
-          "y": 0.006,
-          "yaw": 0.0,
-          "z": 0.006
-        },
-        "desired": {
-          "pitch": 0.0,
-          "roll": 0.0,
-          "x": 0.009,
-          "y": 0.006,
-          "yaw": 0.0,
-          "z": 0.006
-        },
-        "p": [
-          0.02,
-          0.02,
-          0.03
-        ],
-        "t": 0.2
-      }
-    ]
+    }
   },
   "meta": {
     "max_angular_vel": 1.5,
     "max_dt_for_vel_clamp": 0.05,
     "max_pos_vel": 0.05,
-    "notes": "Deterministic v1 trajectories from clutch+behavior+velocity clamp. Antennas zeroed where listed for reproducibility.",
-    "source_commit": "47eb67f",
-    "translation_scale": 0.3
+    "notes": "Deterministic v1 trajectories from clutch+behavior+velocity clamp. Antennas zeroed where listed for reproducibility. Translation case removed in protocol v4 (rotation-only).",
+    "source_commit": "47eb67f"
   }
 }

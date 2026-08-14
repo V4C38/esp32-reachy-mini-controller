@@ -1,12 +1,13 @@
 #include "ui.h"
 
-#include <math.h>
+#include <stdatomic.h>
 
 #include "config.h"
 #include "ui_face.h"
 #include "ui_settings.h"
 
 #include "bsp/esp-bsp.h"
+#include "driver/gpio.h"
 #include "esp_log.h"
 #include "imu.h"
 #include "nvs.h"
@@ -14,65 +15,27 @@
 #include "lvgl.h"
 
 #define UI_TICK_MS 33
-
-/* Relative rotation, in rad, that deflects the face to its limit. */
-#define MOTION_ROT_FS 0.20f
-/* How fast the neutral pose trails the device, in seconds. */
-#define MOTION_REF_TAU 1.5f
-#define MOTION_LPF 0.45f
-#define MOTION_ROT_W 0.90f
-#define MOTION_POS_W 0.75f
+/* Gray Starting… until first link, then fall back to DISCONNECTED. */
+#define BOOT_TIMEOUT_MS 15000
 
 static const char *TAG = "ui";
 
 static bool s_linked;
 static bool s_linked_req;
+static bool s_booting = true;
+static uint32_t s_boot_start_ms;
 static bool s_engaged;
 static bool s_settings;
-static bool s_reset_req;
+static atomic_bool s_connect_req;
 static float s_gain = GAIN_DEFAULT;
 static uint32_t s_press_ms;
 static uint32_t s_last_tap_ms;
 static int s_tap_count;
-static bool s_pressing;
+static bool s_btn_stable;      /* true = pressed (GPIO low) */
+static bool s_btn_raw;
+static uint32_t s_btn_change_ms;
 
-static float s_qref[4] = {1.f, 0.f, 0.f, 0.f};
-static bool s_qref_valid;
-static float s_mx, s_my, s_mr;
-static int s_brightness = -1;
-static int s_brightness_pending = -1;
-
-static float clamp1(float v)
-{
-    if (v > 1.f) return 1.f;
-    if (v < -1.f) return -1.f;
-    return v;
-}
-
-/* out = conj(a) * b */
-static void q_rel(const float a[4], const float b[4], float out[4])
-{
-    float aw = a[0], ax = -a[1], ay = -a[2], az = -a[3];
-    out[0] = aw * b[0] - ax * b[1] - ay * b[2] - az * b[3];
-    out[1] = aw * b[1] + ax * b[0] + ay * b[3] - az * b[2];
-    out[2] = aw * b[2] - ax * b[3] + ay * b[0] + az * b[1];
-    out[3] = aw * b[3] + ax * b[2] - ay * b[1] + az * b[0];
-}
-
-/* out = conj(q) * v * q — world vector expressed in body axes. */
-static void q_rotate_inv(const float q[4], const float v[3], float out[3])
-{
-    float qw = q[0], qx = -q[1], qy = -q[2], qz = -q[3];
-    float uvx = qy * v[2] - qz * v[1];
-    float uvy = qz * v[0] - qx * v[2];
-    float uvz = qx * v[1] - qy * v[0];
-    float uuvx = qy * uvz - qz * uvy;
-    float uuvy = qz * uvx - qx * uvz;
-    float uuvz = qx * uvy - qy * uvx;
-    out[0] = v[0] + 2.f * (qw * uvx + uuvx);
-    out[1] = v[1] + 2.f * (qw * uvy + uuvy);
-    out[2] = v[2] + 2.f * (qw * uvz + uuvz);
-}
+static lv_obj_t *s_unlinked_lab;
 
 static void persist_gain(void)
 {
@@ -96,38 +59,27 @@ static void load_gain(void)
     nvs_close(h);
 }
 
-/* Queue a brightness level. Applied only from the LVGL task so panel IO
- * never races a QSPI flush from another context. */
-static void request_brightness(void)
+static void apply_status_label(void)
 {
-    int b;
-    if (s_engaged || s_settings) b = UI_BRIGHTNESS_ENGAGED;
-    else if (s_linked) b = UI_BRIGHTNESS_IDLE;
-    else b = UI_BRIGHTNESS_DISCONNECTED;
-    s_brightness_pending = b;
-}
-
-static void flush_brightness(void)
-{
-    if (s_brightness_pending < 0 || s_brightness_pending == s_brightness) return;
-    s_brightness = s_brightness_pending;
-    if (bsp_display_brightness_set(s_brightness) != ESP_OK) {
-        /* Panel IO failed — retry next tick instead of caching a lie. */
-        s_brightness = -1;
+    if (!s_unlinked_lab) return;
+    if (s_linked) {
+        lv_obj_add_flag(s_unlinked_lab, LV_OBJ_FLAG_HIDDEN);
+    } else if (s_booting) {
+        lv_label_set_text(s_unlinked_lab, "Starting...");
+        lv_obj_set_style_text_color(s_unlinked_lab, lv_color_hex(0x666666), 0);
+        lv_obj_clear_flag(s_unlinked_lab, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_label_set_text(s_unlinked_lab, "DISCONNECTED");
+        lv_obj_set_style_text_color(s_unlinked_lab, lv_color_hex(0xCC2222), 0);
+        lv_obj_clear_flag(s_unlinked_lab, LV_OBJ_FLAG_HIDDEN);
     }
-}
-
-static void apply_brightness(void)
-{
-    request_brightness();
-    flush_brightness();
+    ui_settings_set_connect_visible(!s_linked && !s_booting);
 }
 
 static void apply_face(void)
 {
-    int mode = 2;
-    if (s_linked) mode = s_engaged ? 1 : 0;
-    ui_face_set_mode(mode);
+    /* 0 disengaged (closed eyes), 1 engaged (open eyes). */
+    ui_face_set_mode(s_engaged ? 1 : 0);
 }
 
 static void set_engaged(bool on)
@@ -146,19 +98,16 @@ static void set_engaged(bool on)
             ESP_LOGI(TAG, "engage accel=[%.2f %.2f %.2f] gyro=[%.3f %.3f %.3f]",
                      a[0], a[1], a[2], g[0], g[1], g[2]);
         }
-        imu_reset_displacement();
-        s_qref_valid = false;
     }
     apply_face();
-    apply_brightness();
 }
 
 static void settings_open(void)
 {
     set_engaged(false);
     s_settings = true;
+    s_tap_count = 0;
     ui_settings_show(true);
-    apply_brightness();
 }
 
 static void settings_close(void)
@@ -166,99 +115,56 @@ static void settings_close(void)
     persist_gain();
     ui_settings_show(false);
     s_settings = false;
+    s_tap_count = 0;
     apply_face();
-    apply_brightness();
 }
 
-static void settings_reset(void)
+static void settings_connect(void)
 {
-    s_reset_req = true;
-    imu_reset_displacement();
-    s_qref_valid = false;
+    atomic_store(&s_connect_req, true);
+    ESP_LOGI(TAG, "connect to app requested");
 }
 
+/* Double-tap toggles settings. Touch no longer engages or disengages. */
 static void on_touch(lv_event_t *e)
 {
-    if (s_settings) return;
-
     lv_event_code_t code = lv_event_get_code(e);
     uint32_t now = lv_tick_get();
 
     if (code == LV_EVENT_PRESSED) {
-        s_pressing = true;
         s_press_ms = now;
         return;
     }
     if (code != LV_EVENT_RELEASED && code != LV_EVENT_PRESS_LOST) return;
 
-    uint32_t held = now - s_press_ms;
-    s_pressing = false;
-    set_engaged(false);
-
-    if (held >= TOUCH_ENGAGE_MS) return;
+    /* Ignore long presses so accidental holds do not count as taps. */
+    if ((now - s_press_ms) >= TOUCH_DOUBLE_TAP_MS) return;
 
     if (now - s_last_tap_ms < TOUCH_DOUBLE_TAP_MS) s_tap_count++;
     else s_tap_count = 1;
     s_last_tap_ms = now;
     if (s_tap_count >= 2) {
         s_tap_count = 0;
-        settings_open();
+        if (s_settings) settings_close();
+        else settings_open();
     }
 }
 
-static void motion_update(void)
+/* BOOT (GPIO0, active-low). Never PWR / EXIO4. */
+static void poll_boot_button(uint32_t now)
 {
-    imu_integrate_state_t st;
-    imu_get_state(&st);
-    if (!st.ready) return;
-
-    float q[4] = {st.q[0], st.q[1], st.q[2], st.q[3]};
-    if (!s_qref_valid) {
-        for (int i = 0; i < 4; i++) s_qref[i] = q[i];
-        s_qref_valid = true;
-    }
-
-    float rel[4];
-    q_rel(s_qref, q, rel);
-    if (rel[0] < 0.f) {
-        for (int i = 0; i < 4; i++) rel[i] = -rel[i];
-    }
-    /* Small-angle vector part ~= rotation about each body axis, in rad. */
-    float rot_x = 2.f * rel[1]; /* pitch, about the right axis */
-    float rot_y = 2.f * rel[2]; /* pan, about the up axis */
-    float rot_z = 2.f * rel[3]; /* roll, about the screen normal */
-
-    /* The neutral pose trails the device, so a held attitude drifts back to
-     * centre while quick moves still deflect the face. */
-    float k = (UI_TICK_MS / 1000.f) / MOTION_REF_TAU;
-    float dot = 0.f;
-    for (int i = 0; i < 4; i++) dot += s_qref[i] * q[i];
-    float sign = dot < 0.f ? -1.f : 1.f;
-    float n = 0.f;
-    for (int i = 0; i < 4; i++) {
-        s_qref[i] += k * (sign * q[i] - s_qref[i]);
-        n += s_qref[i] * s_qref[i];
-    }
-    n = sqrtf(n);
-    if (n < 1e-6f) {
-        s_qref_valid = false;
+    bool raw = gpio_get_level(BUTTON_GPIO) == 0;
+    if (raw != s_btn_raw) {
+        s_btn_raw = raw;
+        s_btn_change_ms = now;
         return;
     }
-    for (int i = 0; i < 4; i++) s_qref[i] /= n;
+    if ((now - s_btn_change_ms) < BUTTON_DEBOUNCE_MS) return;
+    if (raw == s_btn_stable) return;
 
-    float p_body[3];
-    q_rotate_inv(q, st.p, p_body);
-    float pos_scale = st.p_max > 1e-6f ? 1.f / st.p_max : 0.f;
-
-    float tx = MOTION_ROT_W * (rot_y / MOTION_ROT_FS) + MOTION_POS_W * (p_body[0] * pos_scale);
-    float ty = MOTION_ROT_W * (-rot_x / MOTION_ROT_FS) + MOTION_POS_W * (p_body[1] * pos_scale);
-    float tr = rot_z / MOTION_ROT_FS;
-
-    s_mx += MOTION_LPF * (clamp1(tx) - s_mx);
-    s_my += MOTION_LPF * (clamp1(ty) - s_my);
-    s_mr += MOTION_LPF * (clamp1(tr) - s_mr);
-
-    ui_face_set_motion(s_mx, s_my, s_mr);
+    s_btn_stable = raw;
+    if (!raw || s_settings) return; /* rising edge of press only */
+    set_engaged(!s_engaged);
 }
 
 static void ui_timer_cb(lv_timer_t *t)
@@ -268,22 +174,14 @@ static void ui_timer_cb(lv_timer_t *t)
 
     if (s_linked_req != s_linked) {
         s_linked = s_linked_req;
-        apply_face();
-        request_brightness();
+        if (s_linked) s_booting = false;
+        apply_status_label();
     }
-    flush_brightness();
-
-    if (s_pressing && !s_settings && !s_engaged &&
-        (now - s_press_ms) >= TOUCH_ENGAGE_MS) {
-        s_tap_count = 0;
-        set_engaged(true);
+    if (s_booting && (now - s_boot_start_ms) >= BOOT_TIMEOUT_MS) {
+        s_booting = false;
+        apply_status_label();
     }
-
-    /* Skip high-rate motion invalidates while settings are open or offline —
-     * those used to starve the QSPI path. */
-    if (!s_settings && s_linked) {
-        motion_update();
-    }
+    poll_boot_button(now);
 }
 
 esp_err_t ui_init(void)
@@ -296,15 +194,26 @@ esp_err_t ui_init(void)
     ESP_ERROR_CHECK(nvs_ret);
 
     load_gain();
+
+    /* BOOT button only (GPIO0). Do not touch PWR / TCA9554 EXIO4. */
+    gpio_config_t btn = {
+        .pin_bit_mask = 1ULL << BUTTON_GPIO,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&btn));
+    s_btn_raw = gpio_get_level(BUTTON_GPIO) == 0;
+    s_btn_stable = s_btn_raw;
+    s_btn_change_ms = 0;
+
     lv_display_t *disp = bsp_display_start();
     if (!disp) return ESP_FAIL;
     (void)disp;
 
     /* Landscape is baked into the local Waveshare BSP at add_disp — do not
-     * rotate here. Brightness is applied under the LVGL lock below (once),
-     * then only from ui_timer_cb / touch handlers. */
-    request_brightness();
-
+     * rotate here. Panel stays at stock brightness from init cmds. */
     if (!bsp_display_lock(1000)) {
         ESP_LOGE(TAG, "LVGL lock timeout");
         return ESP_FAIL;
@@ -312,11 +221,17 @@ esp_err_t ui_init(void)
     lv_obj_t *scr = lv_screen_active();
     lv_obj_set_style_bg_color(scr, lv_color_hex(0xEDEBE6), 0);
     ui_face_create(scr);
-    ui_settings_create(scr, settings_close, settings_reset, &s_gain);
+
+    s_unlinked_lab = lv_label_create(scr);
+    lv_obj_set_style_text_font(s_unlinked_lab, &lv_font_montserrat_14, 0);
+    lv_obj_align(s_unlinked_lab, LV_ALIGN_BOTTOM_MID, 0, -12);
+
+    ui_settings_create(scr, settings_close, settings_connect, &s_gain);
+    s_boot_start_ms = lv_tick_get();
+    apply_status_label();
     lv_obj_add_flag(scr, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(scr, on_touch, LV_EVENT_ALL, NULL);
     apply_face();
-    flush_brightness();
     lv_timer_create(ui_timer_cb, UI_TICK_MS, NULL);
     bsp_display_unlock();
 
@@ -324,14 +239,22 @@ esp_err_t ui_init(void)
     return ESP_OK;
 }
 
-void ui_set_linked(bool linked) { s_linked_req = linked; }
+void ui_set_linked(bool linked)
+{
+    s_linked_req = linked;
+    if (linked) s_booting = false;
+}
+
 bool ui_linked(void) { return s_linked; }
 bool ui_engaged(void) { return s_engaged; }
 float ui_get_gain(void) { return s_gain; }
 
-bool ui_take_reset_request(void)
+bool ui_connect_pending(void)
 {
-    if (!s_reset_req) return false;
-    s_reset_req = false;
-    return true;
+    return atomic_load(&s_connect_req);
+}
+
+void ui_clear_connect_request(void)
+{
+    atomic_store(&s_connect_req, false);
 }
