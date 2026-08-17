@@ -41,6 +41,8 @@ ANTENNA_TAU_SEC = 0.39
 MAX_ANGULAR_VEL = 1.5  # rad/s (~86 deg/s), matching Spectacles
 MAX_POS_VEL = 0.030  # 30 mm/s
 MAX_DT_FOR_VEL_CLAMP = 0.05
+# Appear/disappear slews (BOOT engage/clutch) run faster than streaming.
+ANIM_VEL_MULT = 2.5
 
 LIMIT_BODY_YAW_RAD = 160.0 * math.pi / 180.0
 LIMIT_HEAD_YAW_RAD = math.radians(150.0)  # 30° of margin from the ±180° IK wrap
@@ -64,18 +66,10 @@ HOLD_TILT = R.from_euler("x", math.pi / 2.0)
 PITCH_ROLL_WINDOW_RAD = math.radians(40.0)
 PITCH_ROLL_SCALE = ELLIPSOID_PITCH_MAX_RAD / PITCH_ROLL_WINDOW_RAD  # 25/40 = 0.625
 
-# Adaptive yaw: average gain eases from 1:1 at rest to 2:1 at 50° of pan, then holds.
-# Quadratic ease-in keeps short pans near 1:1, then catches up toward 2:1.
-#   5° pan → ~5.05° head;  25° pan → 31.25°;  50° pan → 100°.
-HORIZONTAL_YAW_FULL_RAD = math.radians(50.0)
-HORIZONTAL_YAW_GAIN_MIN = 1.0
-HORIZONTAL_YAW_GAIN_MAX = 2.0
-HORIZONTAL_YAW_EASE_POWER = 2.0
-
 # Device-frame rotation gains, applied to the clutch-relative rotation vector
 # *before* DEV_TO_HEAD. Body axes after IMU_MAP / firmware ui.c:
 #   X = tip top toward user (forward tilt)
-#   Y = USB-down in-place turn (horizontal pan) — adaptive, see horizontal_yaw_gain
+#   Y = USB-down in-place turn (horizontal pan) — 1:1
 #   Z = raise right edge (sideways roll)
 FORWARD_GAIN = PITCH_ROLL_SCALE  # device X → head pitch (engage-relative)
 SIDEWAYS_GAIN = PITCH_ROLL_SCALE  # device Z → head roll (engage-relative)
@@ -119,27 +113,6 @@ def disengaged_rest_pose() -> dict[str, float]:
     pose["z"] = DISENGAGED_Z
     pose["pitch"] = DISENGAGED_PITCH
     return pose
-
-
-def horizontal_yaw_gain(pan_rad: float) -> float:
-    """Average head-yaw / device-pan gain: 1 at 0°, 2 at ≥50° of pan.
-
-    Extra gain uses a quadratic ease-in so small pans stay close to 1:1.
-    """
-    span = abs(float(pan_rad))
-    if span <= 0.0:
-        return HORIZONTAL_YAW_GAIN_MIN
-    t = min(span / HORIZONTAL_YAW_FULL_RAD, 1.0)
-    eased = t ** HORIZONTAL_YAW_EASE_POWER
-    return HORIZONTAL_YAW_GAIN_MIN + eased * (
-        HORIZONTAL_YAW_GAIN_MAX - HORIZONTAL_YAW_GAIN_MIN
-    )
-
-
-def adaptive_horizontal_yaw(pan_rad: float) -> float:
-    """Map engage-relative pan to head yaw (1:1 short, 2:1 by 50°)."""
-    pan = float(pan_rad)
-    return pan * horizontal_yaw_gain(pan)
 
 
 def _clamp(value: float, lo: float, hi: float) -> float:
@@ -223,10 +196,9 @@ def quat_relative_rpy(q_ref: np.ndarray, q_device: np.ndarray) -> tuple[float, f
 
 
 def scale_device_rotation(r_rel_dev: R) -> R:
-    """Scale rotation about each ESP32 body axis (tilt window + adaptive yaw)."""
+    """Scale rotation about each ESP32 body axis (tilt window; yaw is 1:1)."""
     rv = r_rel_dev.as_rotvec()
     rv[0] *= FORWARD_GAIN
-    rv[1] = adaptive_horizontal_yaw(float(rv[1]))
     rv[2] *= SIDEWAYS_GAIN
     return R.from_rotvec(rv)
 
@@ -340,17 +312,19 @@ def speed_lock(
     dt: float,
     *,
     apply_ellipsoid: bool = True,
+    max_ang_vel: float = MAX_ANGULAR_VEL,
+    max_pos_vel: float = MAX_POS_VEL,
 ) -> tuple[dict[str, float], float]:
     """Cap one streaming command against the last delivered pose.
 
-    Roll, pitch, yaw, and body yaw each get an independent MAX_ANGULAR_VEL
+    Roll, pitch, yaw, and body yaw each get an independent angular-velocity
     budget (linear deltas — yaw is a bounded axis, not a wrap). Positional
     slews (appear/disappear/reset) use Euclidean distance. `dt` is capped so
     stalls/reconnects cannot accumulate permission for a snap.
     """
     dt_c = min(max(dt, 0.0), MAX_DT_FOR_VEL_CLAMP)
-    max_d_ang = MAX_ANGULAR_VEL * dt_c
-    max_d_pos = MAX_POS_VEL * dt_c
+    max_d_ang = max_ang_vel * dt_c
+    max_d_pos = max_pos_vel * dt_c
     send = {k: float(desired[k]) for k in POSE_AXES}
 
     dp = np.array([desired[k] - baseline[k] for k in POSITIONAL_AXES], dtype=np.float64)
@@ -722,7 +696,7 @@ def _update_clutch(state: ControlState, sample: Sample, *, allow_engage: bool) -
         d = _wrap_delta(heading_last, h) if heading_last is not None else 0.0
         heading_unwrapped = heading_unwrapped + d
         heading_last = h
-        yaw = adaptive_horizontal_yaw(heading_unwrapped)
+        yaw = heading_unwrapped
         roll, pitch = tilt_head_rp(q_ref, q_dev, h)
         desired = {
             "x": base["x"],
@@ -735,11 +709,9 @@ def _update_clutch(state: ControlState, sample: Sample, *, allow_engage: bool) -
         prev_at_pos = _yaw_at_positive_stop(state.desired_pose["yaw"], state.body_yaw)
         prev_at_neg = _yaw_at_negative_stop(state.desired_pose["yaw"], state.body_yaw)
         if heading_unwrapped > yaw_unwrapped and prev_at_pos:
-            yaw = adaptive_horizontal_yaw(yaw_unwrapped)
-            desired["yaw"] = base["yaw"] + gain * yaw
+            desired["yaw"] = base["yaw"] + gain * yaw_unwrapped
         elif heading_unwrapped < yaw_unwrapped and prev_at_neg:
-            yaw = adaptive_horizontal_yaw(yaw_unwrapped)
-            desired["yaw"] = base["yaw"] + gain * yaw
+            desired["yaw"] = base["yaw"] + gain * yaw_unwrapped
         else:
             yaw_unwrapped = heading_unwrapped
     elif falling:

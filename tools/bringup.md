@@ -43,8 +43,7 @@ Engage and move slowly. The screen *is* Reachy's face. Control is
 
 Rotation remap lives in `control.py` (`DEV_TO_HEAD` + similarity transform).
 Roll and pitch use a 40° board window from the **engage snapshot** to span
-the head's ±25°. Yaw is adaptive (1:1 short pans, quadratic ease-in to 2:1
-by 50° of pan). The
+the head's ±25°. Yaw is 1:1 with the board pan. The
 on-device Motion Multiplier slider (0.1×–2×) scales all rotation axes equally.
 
 ## 4. Clutch feel
@@ -72,7 +71,7 @@ on-device Motion Multiplier slider (0.1×–2×) scales all rotation axes equall
 - [ ] Confirm the WS link with `/api/status` while the serial port is **closed**. USB-Serial/JTAG capture (even `--no-reset`) can stall `transport_poll_write` and look like reconnects. `python tools/soak_link.py --seconds 90 --require-connected` polls at 1 Hz and prints `last_diag` / close code on any flip.
 - [ ] Engaged stream 10+ minutes: no flush timeout storms, no regular WS reconnects
 - [ ] Optional: film the static face at 30 fps / 1/60 s shutter — motion-tracking bands should be gone (panel PWM scan may still show; see README *Camera banding when filming*)
-- [ ] Head never exceeds 86 °/s per axis / 30 mm/s on streaming `set_target`
+- [ ] Head never exceeds 86 °/s per axis / 30 mm/s on streaming `set_target` (appear/disappear may use 2.5×)
 - [ ] Record heap/HWM into `tools/baselines/firmware_resources.md`
 
 ## 7. Log-only first

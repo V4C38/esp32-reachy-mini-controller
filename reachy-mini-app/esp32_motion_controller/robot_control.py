@@ -18,8 +18,11 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from esp32_motion_controller.control import (
+    ANIM_VEL_MULT,
     APPEAR_ANTENNA_SPEED_MULT,
     CONTROL_HZ,
+    MAX_ANGULAR_VEL,
+    MAX_POS_VEL,
     STALE_PACKET_SEC,
     Command,
     ControlState,
@@ -139,8 +142,9 @@ class RobotControl:
     def _guard_command(self, command: Command, now: float) -> Command:
         """Cap (or drop) an incoming pose before it reaches the robot.
 
-        Appear/disappear slews are speed-locked. Streaming jumps larger than
-        CULL_* are discarded so a stall cannot accumulate into a snap.
+        Appear/disappear slews are speed-locked (faster than streaming).
+        Streaming jumps larger than CULL_* are discarded so a stall cannot
+        accumulate into a snap.
         """
         del now
         ref_pose = (
@@ -168,6 +172,7 @@ class RobotControl:
                     body_yaw=ref_body,
                     antennas=command.antennas,
                 )
+        anim_slew = self._anim in {"appear", "disappear"}
         pose, body = speed_lock(
             ref_pose,
             ref_body,
@@ -175,6 +180,8 @@ class RobotControl:
             command.body_yaw,
             self.dt,
             apply_ellipsoid=self._state.engaged and self._anim is None,
+            max_ang_vel=MAX_ANGULAR_VEL * ANIM_VEL_MULT if anim_slew else MAX_ANGULAR_VEL,
+            max_pos_vel=MAX_POS_VEL * ANIM_VEL_MULT if anim_slew else MAX_POS_VEL,
         )
         return Command(pose=pose, body_yaw=body, antennas=command.antennas)
 

@@ -34,6 +34,7 @@ There is no connection, handshake, ping/pong, or reconnect. A lost datagram cost
 | Python → ESP32 state reply | one datagram per received sample |
 | Python control / SDK command loop | 20 Hz fixed-rate, one SDK call in flight |
 | Streaming SDK speed lock | 86 °/s per-axis rotation, 30 mm/s positional slews |
+| Appear/disappear SDK speed lock | 215 °/s per-axis rotation, 75 mm/s positional slews (2.5× streaming) |
 
 The device must never queue catch-up samples. The host keeps only the latest valid sample.
 
@@ -158,14 +159,14 @@ One reply per received sample (and per hello). Same shape:
 - Engage control is **rotation only**: the IMU stream drives roll/pitch/yaw. Head `x`/`y`/`z` stay at the clutch base pose while engaged. Host-owned appear/disappear/reset slews still move position.
 - Appear and disappear run **only** on the BOOT button edge. A sample gap or unlink must not duck or rise. First app start may skip appear (posture unknown).
 - If no valid sample arrives for **600 ms** and the controller is absent, the host force-disengages in place (holds the last pose). It does not run disappear.
-- Every outbound command (streaming, appear, disappear, reset) is mapped through the last delivered pose: jumps **> 20 mm or 20°** are dropped; everything else is capped at **86 °/s per axis** (roll, pitch, yaw independently) and **30 mm/s** positional slews per 50 ms tick. Head yaw is clamped to **±150°** (30° of margin from the ±180° representation wrap) and the head–body yaw delta to **±65°**; those workspace limits are applied after the per-tick cap so an infeasible pair is never sent.
+- Every outbound command (streaming, appear, disappear, reset) is mapped through the last delivered pose: jumps **> 20 mm or 20°** are dropped; streaming and reset are capped at **86 °/s per axis** (roll, pitch, yaw independently) and **30 mm/s** positional slews per 50 ms tick; appear/disappear use **215 °/s** and **75 mm/s** (2.5×). Head yaw is clamped to **±150°** (30° of margin from the ±180° representation wrap) and the head–body yaw delta to **±65°**; those workspace limits are applied after the per-tick cap so an infeasible pair is never sent.
 - The robot SDK is only ever called with `set_target` — never a blocking `goto_target`.
 - A same-`boot_id` stream keeps `q_ref`, desired pose, button latch, and posture. A new boot ID or fault follows the normal reseed path.
 
 ## Appear / disappear
 
 BOOT appear/disappear is owned by the host as speed-locked `set_target` slews
-(same 86 °/s per-axis / 30 mm/s cap as streaming). No exclusive `goto_target`.
+at 2.5× the streaming cap (215 °/s per-axis / 75 mm/s). No exclusive `goto_target`.
 
 - **Disappear** (BOOT off only): slew to rest pose (`z = -0.05` m, `pitch = +5°`).
 - **Appear** (BOOT on from ducked rest): slew to reset pose. Unknown posture
@@ -188,8 +189,7 @@ M = [[0, 0, 1],   # head_x ← device_z  (face)
 
 On engage, Python snapshots device `q` as the clutch origin.
 Roll/pitch/yaw are all relative to the engage pose (40° of board tilt spans ±25° of
-head travel). Yaw gain is adaptive: 1:1 at rest, quadratic ease-in to 2:1 by 50° of
-pan (5°→~5.05°, 25°→31.25°, 50°→100°), then holding 2:1. Pitch and roll stay inside
+head travel). Yaw is 1:1 with the board pan. Pitch and roll stay inside
 the Stewart ±25° stop; only yaw unwraps past that. Yaw heading is the azimuth of
 the board's **right edge** (device +X), so a nod cannot leak into yaw. Yaw itself
 is a bounded linear axis in **±150°** (never ±180°, which is the IK wrap that

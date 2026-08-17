@@ -13,6 +13,7 @@ import numpy as np
 import pytest
 
 from esp32_motion_controller.control import (
+    ANIM_VEL_MULT,
     DISENGAGED_PITCH,
     DISENGAGED_Z,
     MAX_ANGULAR_VEL,
@@ -248,7 +249,8 @@ async def test_appear_disappear_speed_locked_set_target():
     assert mini.set_target.call_count == 1
     assert control._anim == "appear"
     dz = abs(control._sent_pose["z"] - DISENGAGED_Z)
-    assert dz <= MAX_POS_VEL * control.dt + 1e-6
+    assert dz <= MAX_POS_VEL * ANIM_VEL_MULT * control.dt + 1e-6
+    assert dz > MAX_POS_VEL * control.dt
     assert control._posture == "ducked"
 
     control._state = replace(control._state, behavior_t0=t)

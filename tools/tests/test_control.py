@@ -18,9 +18,6 @@ from esp32_motion_controller.control import (
     ELLIPSOID_ROLL_MAX_RAD,
     FORWARD_GAIN,
     HOLD_TILT,
-    HORIZONTAL_YAW_FULL_RAD,
-    HORIZONTAL_YAW_GAIN_MAX,
-    HORIZONTAL_YAW_GAIN_MIN,
     LIMIT_HEAD_BODY_YAW_DELTA_RAD,
     LIMIT_HEAD_YAW_RAD,
     LIMIT_BODY_YAW_RAD,
@@ -32,6 +29,7 @@ from esp32_motion_controller.control import (
     MAX_POS_VEL,
     SIDEWAYS_GAIN,
     STALE_PACKET_SEC,
+    ANIM_VEL_MULT,
     APPEAR_ANTENNA_SPEED_MULT,
     ControlState,
     advance_antennas,
@@ -41,8 +39,6 @@ from esp32_motion_controller.control import (
     dual_sine,
     force_disengage,
     hold_reference,
-    adaptive_horizontal_yaw,
-    horizontal_yaw_gain,
     initial_state,
     note_sample_receipt,
     quat_relative_rpy,
@@ -144,7 +140,7 @@ def test_device_axes_map_to_head():
     pose = step(
         st, now=0.10, dt=0.05, sample=_sample(q=_from_hold(0, 0.1, 0), seq=2), sample_is_fresh=True
     ).state.desired_pose
-    assert abs(pose["yaw"] - adaptive_horizontal_yaw(0.1)) < 1e-5
+    assert abs(pose["yaw"] - 0.1) < 1e-5
 
     st = seed_from_pose(initial_state(robot_available=True, now=0.0), zero_pose(), 0.0)
     st = step(
@@ -173,7 +169,7 @@ def test_hold_pose_gains_follow_device_axes():
         return np.array([xyzw[3], xyzw[0], xyzw[1], xyzw[2]])
 
     roll, pitch, yaw = relative_head_rpy(q_hold, after_body_axis(np.array([0.0, 1.0, 0.0])))
-    assert abs(yaw - adaptive_horizontal_yaw(angle)) < 1e-5
+    assert abs(yaw - angle) < 1e-5
     assert abs(roll) < 1e-5 and abs(pitch) < 1e-5
 
     roll, pitch, yaw = relative_head_rpy(q_hold, after_body_axis(np.array([1.0, 0.0, 0.0])))
@@ -191,24 +187,7 @@ def test_hold_pose_gains_follow_device_axes():
     assert abs(yaw) < 1e-5
 
 
-def test_adaptive_horizontal_yaw_curve():
-    """Short pans stay near 1:1; quadratic ease-in to 2:1 by 50°."""
-    five = math.radians(5.0)
-    twenty_five = math.radians(25.0)
-    fifty = math.radians(50.0)
-    sixty = math.radians(60.0)
-    assert adaptive_horizontal_yaw(0.0) == pytest.approx(0.0)
-    assert horizontal_yaw_gain(0.0) == pytest.approx(HORIZONTAL_YAW_GAIN_MIN)
-    assert adaptive_horizontal_yaw(five) == pytest.approx(five * 1.01)
-    assert adaptive_horizontal_yaw(twenty_five) == pytest.approx(twenty_five * 1.25)
-    assert abs(adaptive_horizontal_yaw(twenty_five)) < abs(twenty_five * 1.5)
-    assert adaptive_horizontal_yaw(fifty) == pytest.approx(fifty * HORIZONTAL_YAW_GAIN_MAX)
-    assert adaptive_horizontal_yaw(sixty) == pytest.approx(sixty * HORIZONTAL_YAW_GAIN_MAX)
-    assert adaptive_horizontal_yaw(-fifty) == pytest.approx(-fifty * HORIZONTAL_YAW_GAIN_MAX)
-    assert HORIZONTAL_YAW_FULL_RAD == pytest.approx(math.radians(50.0))
-
-
-def test_adaptive_yaw_through_clutch():
+def test_yaw_is_one_to_one_through_clutch():
     st = seed_from_pose(initial_state(robot_available=True, now=0.0), zero_pose(), 0.0)
     st = step(
         st, now=0.05, dt=0.05, sample=_sample(q=_hold_wxyz(), seq=1), sample_is_fresh=True
@@ -221,8 +200,7 @@ def test_adaptive_yaw_through_clutch():
         sample=_sample(q=_from_hold(0, five, 0), seq=2),
         sample_is_fresh=True,
     ).state.desired_pose
-    assert pose["yaw"] == pytest.approx(adaptive_horizontal_yaw(five), abs=1e-4)
-    assert math.degrees(pose["yaw"]) == pytest.approx(5.05, abs=0.05)
+    assert pose["yaw"] == pytest.approx(five, abs=1e-4)
 
     st = seed_from_pose(initial_state(robot_available=True, now=0.0), zero_pose(), 0.0)
     st = step(
@@ -236,8 +214,7 @@ def test_adaptive_yaw_through_clutch():
         sample=_sample(q=_from_hold(0, twenty_five, 0), seq=2),
         sample_is_fresh=True,
     ).state.desired_pose
-    assert pose["yaw"] == pytest.approx(adaptive_horizontal_yaw(twenty_five), abs=1e-4)
-    assert math.degrees(pose["yaw"]) == pytest.approx(31.25, abs=0.05)
+    assert pose["yaw"] == pytest.approx(twenty_five, abs=1e-4)
 
 
 def test_pitch_roll_less_coupled_than_yaw():
@@ -255,10 +232,9 @@ def test_pitch_roll_less_coupled_than_yaw():
     roll, _, _ = relative_head_rpy(q_hold, after_body_axis(np.array([0.0, 0.0, 1.0])))
     assert abs(pitch - roll) < 1e-5
     assert abs(pitch - angle * FORWARD_GAIN) < 1e-5
-    assert abs(yaw - adaptive_horizontal_yaw(angle)) < 1e-5
+    assert abs(yaw - angle) < 1e-5
     assert abs(yaw) > abs(pitch)
     assert FORWARD_GAIN == SIDEWAYS_GAIN
-    assert HORIZONTAL_YAW_GAIN_MAX > FORWARD_GAIN
 
 
 def test_gain_and_release_commit():
@@ -319,7 +295,7 @@ def test_stale_force_disengage_commits():
     assert st.engaged
     result = step(st, now=0.10 + STALE_PACKET_SEC + 0.01, dt=0.05, sample=None, sample_is_fresh=False, controller_present=False)
     assert not result.state.engaged
-    assert abs(result.state.base_pose["yaw"] - adaptive_horizontal_yaw(0.2)) < 1e-5
+    assert abs(result.state.base_pose["yaw"] - 0.2) < 1e-5
 
 
 def test_ellipsoid_and_yaw_delta():
@@ -437,6 +413,23 @@ def test_speed_lock_translation():
     send, _ = speed_lock(base, 0.0, desired, 0.0, 0.05)
     dist = math.sqrt(sum(send[k] ** 2 for k in ("x", "y", "z")))
     assert dist <= MAX_POS_VEL * 0.05 + 1e-9
+
+
+def test_speed_lock_anim_vel_mult():
+    base = zero_pose()
+    desired = zero_pose()
+    desired["z"] = -0.20
+    send, _ = speed_lock(
+        base,
+        0.0,
+        desired,
+        0.0,
+        0.05,
+        apply_ellipsoid=False,
+        max_pos_vel=MAX_POS_VEL * ANIM_VEL_MULT,
+    )
+    dist = abs(send["z"])
+    assert dist == pytest.approx(MAX_POS_VEL * ANIM_VEL_MULT * 0.05, abs=1e-9)
 
 
 def test_speed_lock_dt_cap_blocks_stall_jump():
@@ -607,7 +600,7 @@ def test_disengaged_pan_does_not_change_head_yaw():
         st, now=0.10, dt=0.05, sample=_sample(q=_from_hold(0, 0.15, 0), seq=2), sample_is_fresh=True
     ).state
     committed_yaw = st.desired_pose["yaw"]
-    assert abs(committed_yaw - adaptive_horizontal_yaw(0.15)) < 1e-5
+    assert abs(committed_yaw - 0.15) < 1e-5
     st = step(
         st,
         now=0.15,
@@ -694,7 +687,7 @@ def test_yaw_holds_at_stop_then_returns_the_same_way():
     assert stop == pytest.approx(
         st.body_yaw + LIMIT_HEAD_BODY_YAW_DELTA_RAD, abs=1e-3
     )
-    assert adaptive_horizontal_yaw(unwrap_at_stop) > stop
+    assert unwrap_at_stop > stop
 
     st = step(
         st,
@@ -719,7 +712,7 @@ def test_yaw_holds_at_stop_then_returns_the_same_way():
     assert st.yaw_unwrapped == pytest.approx(0.3, abs=1e-4)
     assert st.desired_pose["yaw"] > 0
     assert st.desired_pose["yaw"] < stop
-    assert abs(st.desired_pose["yaw"] - adaptive_horizontal_yaw(0.3)) < 1e-4
+    assert abs(st.desired_pose["yaw"] - 0.3) < 1e-4
 
 
 def test_speed_lock_holds_sign_flip_at_stop():
